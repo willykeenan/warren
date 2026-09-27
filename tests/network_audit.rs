@@ -132,6 +132,8 @@ fn no_network_client_dependencies() {
         "rand",
         "rcgen",
         "rusqlite",
+        // System calls without `unsafe` in warren: the open-file limit.
+        "rustix",
         "rustls",
         "serde",
         "serde_json",

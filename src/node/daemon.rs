@@ -354,6 +354,7 @@ impl DaemonHandle {
 
 /// Start the daemon: control socket, forwards and the relay connection loop.
 pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
+    let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
     let paths = cfg.paths.clone();
     paths.ensure()?;
     let ident = IdentityFile::load(&paths)?;
@@ -409,7 +410,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         let d = inner.clone();
         tasks.push(tokio::spawn(async move { d.connect_loop().await }));
     }
-    tracing::info!(node = %inner.ident.name, relay = %inner.relay.https(), "warren node started");
+    tracing::info!(node = %inner.ident.name, relay = %inner.relay.https(), open_files, "warren node started");
     Ok(DaemonHandle { inner, tasks })
 }
 
@@ -1046,9 +1047,9 @@ impl DaemonInner {
         loop {
             let (tcp, _) = tokio::select! {
                 _ = self.shutdown.cancelled() => return,
-                r = l.accept() => match r {
-                    Ok(x) => x,
-                    Err(_) => { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
+                r = l.accept() => match crate::net::accepted(r, "forward").await {
+                    Some(x) => x,
+                    None => continue,
                 },
             };
             let _ = tcp.set_nodelay(true);
@@ -1384,7 +1385,10 @@ impl DaemonInner {
         loop {
             let (s, _) = tokio::select! {
                 _ = self.shutdown.cancelled() => break,
-                r = l.accept() => match r { Ok(x) => x, Err(_) => continue },
+                r = l.accept() => match crate::net::accepted(r, "control socket").await {
+                    Some(x) => x,
+                    None => continue,
+                },
             };
             let d = self.clone();
             tokio::spawn(async move { d.control_conn(s).await });

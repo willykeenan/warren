@@ -18,7 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use warren::proto::*;
 
-/// Keep authenticating as `node` until `stop`; keep every welcomed link.
+/// Welcomed links one trial keeps. A new link for the same node replaces the
+/// previous one on the relay, so only the newest ones can still be open.
+const KEEP_LINKS: usize = 64;
+
+/// Keep authenticating as `node` until `stop`; keep the welcomed links that
+/// are still open.
 async fn auth_loop(
     relay_url: String,
     pin: [u8; 32],
@@ -30,11 +35,17 @@ async fn auth_loop(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let url = warren::net::RelayUrl::parse(&relay_url).unwrap();
+    // After a failure, pause briefly instead of retrying in a tight loop (a
+    // failure can mean the process is out of file descriptors).
+    let pause = || tokio::time::sleep(Duration::from_millis(5));
+    let step = Duration::from_secs(10);
     while !stop.load(Ordering::SeqCst) {
         let Ok(mut ws) = warren::ws::connect_relay(&url, Some(pin)).await else {
+            pause().await;
             continue;
         };
-        let Some(Ok(Message::Text(t))) = ws.next().await else {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(step, ws.next()).await else {
+            pause().await;
             continue;
         };
         let RelayHello::Challenge { challenge, .. } = serde_json::from_str(t.as_str()).unwrap();
@@ -45,23 +56,37 @@ async fn auth_loop(
             .await
             .is_err()
         {
+            pause().await;
             continue;
         }
-        let Some(Ok(Message::Text(t))) = ws.next().await else {
+        let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(step, ws.next()).await else {
+            pause().await;
             continue;
         };
         match serde_json::from_str::<RelayVerdict>(t.as_str()) {
-            Ok(RelayVerdict::Welcome { .. }) => links.lock().unwrap().push(RawNode::from_ws(ws)),
-            _ => {
-                // Refused (revoked): nothing more to gain.
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(RelayVerdict::Welcome { .. }) => {
+                let mut l = links.lock().unwrap();
+                l.retain(|n| !n.is_closed());
+                if l.len() >= KEEP_LINKS {
+                    l.remove(0);
+                }
+                l.push(RawNode::from_ws(ws));
             }
+            // Refused (revoked): nothing more to gain.
+            _ => pause().await,
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn revoked_node_cannot_outlive_revocation_by_racing_the_reload() {
+    // Fail instead of hanging if something goes wrong.
+    tokio::time::timeout(Duration::from_secs(180), race_trials())
+        .await
+        .expect("the revocation race trials did not finish within 180 s");
+}
+
+async fn race_trials() {
     let relay = start_relay_with(|c| c.revision_poll = Duration::from_secs(3600)).await;
     let b = enroll_started(&relay, "b").await;
     let (echo, _) = echo_server().await;
@@ -104,8 +129,14 @@ async fn revoked_node_cannot_outlive_revocation_by_racing_the_reload() {
         // Any authentication started from now on is refused.
         tokio::time::sleep(Duration::from_millis(200)).await;
         stop.store(true, Ordering::SeqCst);
-        for t in tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(20), t).await;
+        for mut t in tasks {
+            if tokio::time::timeout(Duration::from_secs(5), &mut t)
+                .await
+                .is_err()
+            {
+                t.abort();
+                let _ = t.await;
+            }
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
 

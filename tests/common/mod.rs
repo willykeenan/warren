@@ -111,7 +111,23 @@ pub async fn start_relay() -> TestRelay {
     start_relay_with(|_| {}).await
 }
 
+/// The relay raises the soft open-file limit as far as the hard limit allows;
+/// say so once if that is still too low for these tests.
+fn check_open_files() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let n = warren::limits::raise_open_files_limit(warren::limits::WANTED_OPEN_FILES);
+        if n < 2048 {
+            eprintln!(
+                "warning: the open file limit is {n} and cannot be raised; some tests need \
+                 about 1000 open files (raise the hard limit, e.g. `ulimit -n 4096`)"
+            );
+        }
+    });
+}
+
 pub async fn start_relay_with(f: impl FnOnce(&mut RelayConfig)) -> TestRelay {
+    check_open_files();
     let dir = tempfile::tempdir().unwrap();
     let captures: Captures = Arc::new(Mutex::new(Vec::new()));
     let mut cfg = relay_config(

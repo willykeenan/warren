@@ -13,6 +13,7 @@
 use anyhow::{bail, Context, Result};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 /// A parsed relay URL (`https://host[:port]`).
@@ -111,9 +112,37 @@ pub async fn dial_loopback(addr: SocketAddr) -> io::Result<TcpStream> {
     Ok(s)
 }
 
+/// How long an accept loop waits after a failed `accept`.
+pub const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
+
+/// The accepted connection, or `None` after logging the error and pausing
+/// for [`ACCEPT_ERROR_PAUSE`]. Accept errors such as running out of file
+/// descriptors repeat immediately, so retrying at once would spin a core.
+pub async fn accepted<T>(r: io::Result<T>, what: &str) -> Option<T> {
+    match r {
+        Ok(x) => Some(x),
+        Err(e) => {
+            tracing::warn!("{what}: accept failed: {e}");
+            tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_accepts_pause() {
+        let t = std::time::Instant::now();
+        assert_eq!(accepted(Ok(7), "test").await, Some(7));
+        assert!(t.elapsed() < ACCEPT_ERROR_PAUSE);
+        let t = std::time::Instant::now();
+        let e = io::Error::from_raw_os_error(24); // EMFILE
+        assert_eq!(accepted::<u8>(Err(e), "test").await, None);
+        assert!(t.elapsed() >= ACCEPT_ERROR_PAUSE);
+    }
 
     #[test]
     fn parse_urls() {

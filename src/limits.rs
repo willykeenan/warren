@@ -51,6 +51,33 @@ pub const NODE_OPEN_BURST: u32 = 60;
 pub const MAX_CONNECTIONS: usize = 16384;
 /// Maximum concurrent connections from one client IP.
 pub const MAX_CONNECTIONS_PER_IP: usize = 256;
+/// Open files the relay and the node daemon ask for at startup (see
+/// [`raise_open_files_limit`]): room for [`MAX_CONNECTIONS`] and more.
+pub const WANTED_OPEN_FILES: u64 = 65536;
+
+/// Raise this process's soft limit on open files towards `want`, never above
+/// the hard limit, and return the soft limit now in effect. Never lowers it.
+///
+/// Processes often start with a soft limit of 256 (macOS) or 1024 (Linux),
+/// far below what a busy relay needs, while the hard limit is much higher.
+pub fn raise_open_files_limit(want: u64) -> u64 {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let cur = getrlimit(Resource::Nofile);
+    let soft = cur.current.unwrap_or(u64::MAX);
+    let mut target = want.min(cur.maximum.unwrap_or(u64::MAX));
+    while target > soft {
+        let new = Rlimit {
+            current: Some(target),
+            maximum: cur.maximum,
+        };
+        if setrlimit(Resource::Nofile, new).is_ok() {
+            return target;
+        }
+        // macOS refuses values above kern.maxfilesperproc: try smaller ones.
+        target = (target / 2).max(soft);
+    }
+    soft
+}
 
 // Checked at compile time: the budgets admit everything flow control allows
 // (every stream sending its whole window in maximal frames), and nodes pace
@@ -260,6 +287,18 @@ mod tests {
         l.forgive(ip);
         assert!(l.begin(ip));
         assert!(!l.begin(ip));
+    }
+
+    #[test]
+    fn open_files_limit_is_raised_not_lowered() {
+        use rustix::process::{getrlimit, Resource};
+        let hard = getrlimit(Resource::Nofile).maximum.unwrap_or(u64::MAX);
+        let want = 2048.min(hard);
+        let got = raise_open_files_limit(2048);
+        assert!(got >= want, "{got} < {want}");
+        let soft = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+        assert!(soft >= want);
+        assert_eq!(raise_open_files_limit(16), soft, "never lowered");
     }
 
     #[test]

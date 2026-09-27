@@ -233,6 +233,7 @@ impl RelayInner {
 
 /// Start a relay.
 pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
+    let open_files = limits::raise_open_files_limit(limits::WANTED_OPEN_FILES);
     crate::fsutil::ensure_private_dir(&cfg.state_dir)?;
     let db = Db::open(&cfg.state_dir)?;
     let resolver = Arc::new(CertResolver::new());
@@ -311,14 +312,10 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
             loop {
                 tokio::select! {
                     _ = inner.shutdown.cancelled() => break,
-                    r = listener.accept() => match r {
-                        Ok((tcp, peer)) => {
+                    r = listener.accept() => {
+                        if let Some((tcp, peer)) = crate::net::accepted(r, "relay").await {
                             let inner = inner.clone();
                             tokio::spawn(async move { handle_conn(inner, tcp, peer).await });
-                        }
-                        Err(e) => {
-                            tracing::warn!("accept failed: {e}");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
@@ -363,7 +360,14 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
             }
         }));
     }
-    tracing::info!(%addr, domain = %cfg.domain, "relay listening");
+    tracing::info!(%addr, domain = %cfg.domain, open_files, "relay listening");
+    if open_files < limits::MAX_CONNECTIONS as u64 + 1024 {
+        tracing::warn!(
+            "the open file limit is {open_files}, too low for the {} connections the relay \
+             accepts; raise its hard limit (for example LimitNOFILE=65536 in a systemd unit)",
+            limits::MAX_CONNECTIONS
+        );
+    }
     Ok(RelayHandle {
         addr,
         http_addr,
