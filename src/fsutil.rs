@@ -12,15 +12,33 @@ pub const FILE_MODE: u32 = 0o600;
 /// Mode for private directories.
 pub const DIR_MODE: u32 = 0o700;
 
-/// Create `dir` (and parents) and force its mode to 0700.
+/// Create `dir` (and parents) and force its mode to 0700. Tightening an
+/// existing directory that others could read is logged as a warning:
+/// `WARREN_HOME` and the relay's state directory should be dedicated
+/// directories, not, say, the home directory itself.
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let meta = fs::metadata(dir)?;
-    if meta.permissions().mode() & 0o777 != DIR_MODE {
-        fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))
-            .with_context(|| format!("setting permissions on {}", dir.display()))?;
+    if let Some(old) = make_private_dir(dir)? {
+        tracing::warn!(
+            "{} was open to other users (mode {old:03o}); warren keeps private keys in it and \
+             set it to 0700. Use a dedicated directory for warren",
+            dir.display()
+        );
     }
     Ok(())
+}
+
+/// [`ensure_private_dir`] without the warning: returns the previous mode of an
+/// existing directory that was open to group or others.
+pub fn make_private_dir(dir: &Path) -> Result<Option<u32>> {
+    let existed = dir.is_dir();
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mode = fs::metadata(dir)?.permissions().mode() & 0o777;
+    if mode == DIR_MODE {
+        return Ok(None);
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))
+        .with_context(|| format!("setting permissions on {}", dir.display()))?;
+    Ok((existed && mode & 0o077 != 0).then_some(mode))
 }
 
 /// Atomically replace `path` with `data`, mode 0600.
@@ -113,5 +131,23 @@ mod tests {
         let g = d.join("db");
         touch_private(&g).unwrap();
         assert_eq!(mode_of(&g).unwrap(), 0o600);
+    }
+
+    #[test]
+    fn tightening_a_shared_directory_is_reported() {
+        let t = tempfile::tempdir().unwrap();
+        let new = t.path().join("new");
+        assert_eq!(make_private_dir(&new).unwrap(), None);
+        assert_eq!(mode_of(&new).unwrap(), 0o700);
+        let shared = t.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(make_private_dir(&shared).unwrap(), Some(0o755));
+        assert_eq!(mode_of(&shared).unwrap(), 0o700);
+        assert_eq!(make_private_dir(&shared).unwrap(), None);
+        // Only ever more restrictive: 0500 becomes 0700 without a report.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(make_private_dir(&shared).unwrap(), None);
+        assert_eq!(mode_of(&shared).unwrap(), 0o700);
     }
 }
