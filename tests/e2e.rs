@@ -1,7 +1,7 @@
 //! End-to-end tests: a real relay (self-signed TLS on 127.0.0.1) and 2-3
 //! nodes with their own temporary homes, driven in-process.
 //!
-//! Security requirements are referenced as SR1..SR9.
+//! Security requirements are referenced as SR1..SR9 (see docs/security.md).
 
 mod common;
 

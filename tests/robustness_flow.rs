@@ -30,10 +30,10 @@ impl StreamHost for Host {
 
 /// Every stream stays within its own 256 KiB window, the stream count stays
 /// under the 1024 per-node cap, and the writer simply has not flushed yet
-/// (a slow uplink). The link must not be torn down: flow control is what is
-/// supposed to bound memory. Today the aggregate of legal windows
-/// (1024 x 256 KiB = 256 MiB) exceeds MAX_LINK_QUEUE (64 MiB), so a sender
-/// that obeys every window closes its own link and every stream on it.
+/// (a slow uplink). The link is not torn down: stream data has its own
+/// budget, which covers every legal window (1024 x 256 KiB), so a sender that
+/// obeys every window never closes its own link, even though the aggregate
+/// exceeds MAX_LINK_QUEUE (64 MiB, the cap for other frames).
 #[tokio::test]
 async fn windows_within_limits_do_not_close_the_link() {
     let streams = (MAX_LINK_QUEUE / STREAM_WINDOW as usize) + 4; // 260, well under 1024
@@ -69,11 +69,9 @@ async fn windows_within_limits_do_not_close_the_link() {
     );
 }
 
-/// The relay forwards DATA to the destination before the destination has
-/// accepted the stream (OPEN_OK). The destination's default-deny policy is
-/// therefore not what bounds bytes queued toward it: any enrolled node can
-/// push a full window per OPEN into another node's outbound queue on the
-/// relay, for ports that node never shared.
+/// The relay holds DATA for a stream until the destination has accepted it
+/// (OPEN_OK), so an enrolled node cannot push a window of data per OPEN into
+/// another node's outbound queue for ports that node never shared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_holds_data_until_destination_accepts() {
     let relay = start_relay().await;
