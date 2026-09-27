@@ -402,6 +402,37 @@ async fn binary_end_to_end() {
     }
     env.ok("b", &["--json", "unpublish", "site"]).await;
 
+    // SR9 at runtime: every TCP connection the relay and daemons hold goes to
+    // the relay port or to loopback services; nothing else is contacted.
+    for (who, pid) in [("relay", relay.id()), ("a", da.id()), ("b", db.id())] {
+        let pid = pid.unwrap().to_string();
+        let Ok(o) = std::process::Command::new("lsof")
+            .args(["-nP", "-a", "-p", &pid, "-iTCP", "-iUDP"])
+            .output()
+        else {
+            eprintln!("lsof unavailable; skipping runtime connection check");
+            break;
+        };
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines().skip(1) {
+            assert!(!line.contains("UDP"), "{who} opened a UDP socket: {line}");
+            if let Some((_, remote)) = line.split_once("->") {
+                let remote = remote.split_whitespace().next().unwrap_or("");
+                assert!(
+                    remote.starts_with("127.0.0.1:") || remote.starts_with("[::1]:"),
+                    "{who} connected to {remote}"
+                );
+            }
+        }
+        if who != "relay" {
+            let relay_port = format!("->127.0.0.1:{port}");
+            assert!(
+                text.contains(&relay_port),
+                "{who} has no relay connection:\n{text}"
+            );
+        }
+    }
+
     // Exit codes for common failure modes.
     let o = env.run("fresh", &["--json", "status"]).await;
     assert_eq!(o.code, 3, "not enrolled: {}", o.stdout);

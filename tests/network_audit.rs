@@ -5,7 +5,9 @@
 //! `src/net.rs` (`dial_relay` for the relay URL from the node's identity file,
 //! `dial_loopback` for local services), the only other network client is the
 //! ACME client in `src/relay/acme.rs`, and no dependency is an HTTP client,
-//! telemetry or update library. This test scans the sources and the manifest.
+//! telemetry or update library. This test scans the sources and the manifest;
+//! `tests/cli.rs` additionally lists the running relay's and daemons' sockets
+//! and checks that every connection goes to the relay or to loopback.
 
 use std::path::{Path, PathBuf};
 
