@@ -437,12 +437,17 @@ async fn binary_end_to_end() {
 
     // SR9 at runtime: every TCP connection the relay and daemons hold goes to
     // the relay port or to loopback services; nothing else is contacted.
+    // Needs lsof; set WARREN_REQUIRE_LSOF=1 (as CI does) to fail without it.
     for (who, pid) in [("relay", relay.id()), ("a", da.id()), ("b", db.id())] {
         let pid = pid.unwrap().to_string();
         let Ok(o) = std::process::Command::new("lsof")
             .args(["-nP", "-a", "-p", &pid, "-iTCP", "-iUDP"])
             .output()
         else {
+            assert!(
+                std::env::var_os("WARREN_REQUIRE_LSOF").is_none_or(|v| v != "1"),
+                "lsof is not installed and WARREN_REQUIRE_LSOF=1"
+            );
             eprintln!("lsof unavailable; skipping runtime connection check");
             break;
         };
@@ -514,9 +519,8 @@ async fn binary_end_to_end() {
     assert_eq!(o.code, 4, "daemon not running: {}", o.stdout);
     let st = env.ok("a", &["--json", "status"]).await;
     assert_eq!(st["daemon"]["running"], false);
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &relay.id().unwrap().to_string()])
-        .status();
+    let pid = rustix::process::Pid::from_raw(relay.id().unwrap() as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
     let st = tokio::time::timeout(Duration::from_secs(10), relay.wait())
         .await
         .unwrap()
