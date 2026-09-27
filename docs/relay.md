@@ -17,7 +17,7 @@ warren relay --domain relay.example.com [certificate source] [options]
 | `--domain HOST` | required | the relay's own host name; nodes use `https://HOST` and sign it into every login |
 | `--publish-domain DOMAIN` | `--domain` | published names live at `NAME.DOMAIN` |
 | `--listen ADDR` | `0.0.0.0:443` | TLS listener for nodes and published names (IPv4; see *DNS records* for IPv6) |
-| `--state DIR` | `$WARREN_HOME/relay` or `~/.warren/relay` | state directory (created `0700`) |
+| `--state DIR` | `$WARREN_HOME/relay` or `~/.warren/relay` | state directory, set to `0700`: use a dedicated one |
 | `--acme EMAIL` | | automatic certificates from an ACME CA (Let's Encrypt by default) |
 | `--acme-directory URL` | Let's Encrypt production | another ACME directory (e.g. a staging CA) |
 | `--http-listen ADDR` | `0.0.0.0:80` with `--acme` | plain-HTTP listener: ACME challenges, redirects to HTTPS (IPv4 by default) |
@@ -110,20 +110,33 @@ in practice means a wildcard (`*.relay.example.com` plus
 
 ### Self-signed (testing)
 
+For a trial on one machine, use `localhost` as the relay's domain (the host in
+`--relay` must resolve to the relay and equal its `--domain`):
+
 ```sh
-warren relay --domain relay.test --self-signed --listen 127.0.0.1:8443
-# warren relay listening on 127.0.0.1:8443 for relay.test
+warren relay --domain localhost --self-signed --listen 127.0.0.1:8443 --state /tmp/warren-relay
+# warren relay listening on 127.0.0.1:8443 for localhost
 # self-signed certificate; nodes join with --insecure-relay-cert-sha256 5e0c...
 ```
 
-The certificate is generated once and kept in the state directory, so the pin
-survives restarts. Nodes pin it at enrollment:
+In a second terminal:
 
 ```sh
-warren join CODE --relay https://relay.test:8443 --insecure-relay-cert-sha256 5e0c...
+warren relay invite --state /tmp/warren-relay
+# prints a code and the join command, including the pin
+WARREN_HOME=/tmp/wa warren join CODE --relay https://localhost:8443 --insecure-relay-cert-sha256 5e0c... --name a
+WARREN_HOME=/tmp/wa warren up
 ```
 
-`warren relay info` prints the pin again.
+Use a second code and `WARREN_HOME=/tmp/wb` (and `--name b`) for the second
+machine, in a third terminal. Then, for example, `WARREN_HOME=/tmp/wb warren
+share 8000` and `WARREN_HOME=/tmp/wa warren forward 9000 b:8000` make
+`127.0.0.1:9000` reach whatever listens on port 8000. Keep `WARREN_HOME`
+short: the control socket inside it must fit in a Unix socket path (about
+100 bytes).
+
+The certificate is generated once and kept in the state directory, so the pin
+survives restarts. `warren relay info` prints it again.
 
 ## Administration
 
@@ -138,6 +151,9 @@ warren relay revoke NAME            # disconnect NAME now and refuse it from now
 warren relay domain add HOST NAME   # custom domain for a published name
 warren relay info                   # counts and the self-signed pin
 ```
+
+On a self-signed relay, `invite` also prints the pin nodes must pass with
+`--insecure-relay-cert-sha256`.
 
 Revoking a node disconnects it at once (also a connection it is making at
 that moment) and releases the names it published; a revoked node can never
@@ -170,6 +186,8 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/warren relay --domain relay.example.com --acme you@example.com --state /var/lib/warren
 Restart=always
 RestartSec=2
+# Room for the relay's 16384 connections (it raises its soft limit up to this).
+LimitNOFILE=65536
 DynamicUser=yes
 StateDirectory=warren
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -219,3 +237,8 @@ and are `0600`.
 | public request head | 32 KiB |
 | relay connections (any kind) | 16384 total, 256 per client IP |
 | enrollment failures | 5 per IP per 10 minutes |
+
+Each connection uses a file descriptor. At startup the relay raises its soft
+open-file limit towards 65536 (never above the hard limit) and logs the
+result; if the hard limit is too low for 16384 connections it warns, and you
+should raise it (`LimitNOFILE=` in the systemd unit above, or `ulimit -Hn`).

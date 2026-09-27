@@ -46,14 +46,22 @@ relay.example.com.     A     203.0.113.10
 
 ### 2. Build
 
-With Rust 1.85 or newer, on the relay host install the binary where `sudo`
-finds it (`sudo` does not search `~/.cargo/bin` on most distributions):
+You need Rust 1.88 or newer. On the relay host, install the binary where
+`sudo` finds it (`sudo` does not search `~/.cargo/bin` on most distributions):
 
 ```sh
-cargo build --release && sudo install -m 755 target/release/warren /usr/local/bin/warren
+git clone https://github.com/willykeenan/warren && cd warren
+cargo build --release --locked
+sudo install -m 755 target/release/warren /usr/local/bin/warren
 ```
 
-On your machines either do the same or run `cargo install --path .`.
+On your machines either do the same or run `cargo install --locked --path .`
+in the clone (without cloning: `cargo install --locked --git
+https://github.com/willykeenan/warren`). `cargo install warren` installs an
+unrelated crate of the same name.
+
+To try warren on one machine first, see *Self-signed (testing)* in
+[docs/relay.md](docs/relay.md).
 
 ### 3. Run the relay (on the server)
 
@@ -62,7 +70,9 @@ sudo warren relay --domain relay.example.com --acme you@example.com --state /var
 ```
 
 The relay listens on 443 (nodes and published names) and, with `--acme`, on 80
-for certificate challenges. Certificates come from Let's Encrypt automatically.
+for certificate challenges. Certificates are requested from Let's Encrypt
+automatically (this has not yet been tested against the live CA; see *Status
+and limitations*).
 See [docs/relay.md](docs/relay.md) for running it as a service, bringing your
 own certificate, and custom domains.
 
@@ -117,6 +127,33 @@ warren devices
 warren publish 3230 --name web      # https://web.relay.example.com/ -> 127.0.0.1:3230
 warren unpublish web
 ```
+
+## Status and limitations
+
+warren is new. Read this before relying on it.
+
+* **Run on macOS only.** The relay, the node daemon and the login service
+  have been used on macOS. Linux is supported by the code (a systemd user
+  unit for nodes, the unit in [docs/relay.md](docs/relay.md) for the relay)
+  and the test suite passes on Linux too (CI runs it there), but warren has
+  not been run on real Linux machines yet; please report problems.
+* **Automatic certificates have not been tested against a real CA.** The
+  pieces around the ACME HTTP-01 exchange (challenge responder, renewal
+  policy, storage) are unit-tested; the exchange with Let's Encrypt itself
+  has not been run end to end. Start with `--acme-directory
+  https://acme-staging-v02.api.letsencrypt.org/directory`, or bring your own
+  certificate with `--cert/--key`.
+* **`warren install` / `uninstall`** are tested by writing the service file
+  to a temporary directory and with a stand-in for the service manager; the
+  real `launchctl` and `systemctl` calls are not run by the tests.
+* **Trust on first use.** The first key a machine sees for a peer comes from
+  the relay; compare fingerprints after enrolling (see *Security model*).
+* **One relay, no direct connections.** All traffic goes through your relay;
+  if it is down, nothing connects.
+* **TCP only**, and the relay's default listeners are IPv4 (see
+  [docs/relay.md](docs/relay.md) for IPv6).
+* The performance figures below were measured on loopback, not over the
+  internet.
 
 ## Commands
 
@@ -177,6 +214,11 @@ directory is `0700` and every file in it `0600`:
 | `warren.sock` | control socket used by the CLI |
 | `logs/warren.log` | daemon log when started by `warren install` on macOS |
 
+Use a dedicated directory for `WARREN_HOME` (and for the relay's `--state`):
+warren sets it to `0700`, and warns when that takes access away from others.
+Keep the path short: the control socket inside it must fit in a Unix socket
+path (103 bytes on macOS, 107 on Linux), and warren says so when it does not.
+
 On Linux the login service logs to the user journal: `journalctl --user -u
 warren` (with a custom `WARREN_HOME` the unit name has a suffix;
 `warren install --json` prints it as `label`).
@@ -207,6 +249,14 @@ them.
   connects to the local service only after the opener has completed a fresh
   handshake, so replaying a recorded one gets the relay nowhere;
 * impersonate a machine whose key you have pinned.
+
+**Shares open to every machine.** `warren share PORT` without `--to` admits
+every machine enrolled on the relay, and the relay decides who is enrolled.
+Whoever controls the relay host (or its state directory) can enroll a new
+machine and reach such shares; the destination pins that machine's key on
+first contact like any other. Use `--to NAME,...` for anything sensitive: a
+listed name whose key this machine has already pinned cannot be taken over by
+a different key.
 
 Text that comes from other machines or from the relay (refusal messages,
 names) is shown with control characters escaped, so it cannot rewrite your
@@ -300,6 +350,7 @@ on one host, TLS + Noise, `cargo test --release --test bench -- --ignored
 
 ```sh
 cargo test                          # unit + end-to-end tests (real relay, 2-4 nodes)
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release --test bench -- --ignored --nocapture
 ```
@@ -307,7 +358,20 @@ cargo test --release --test bench -- --ignored --nocapture
 The end-to-end tests start a relay with a self-signed certificate on
 `127.0.0.1` and nodes with temporary homes, and cover each security
 requirement, including a capture of everything the relay receives and sends
-that must never contain the plaintext sent over a private link.
+that must never contain the plaintext sent over a private link. The
+requirements the tests check are listed in [docs/security.md](docs/security.md).
+
+Some tests hold about a thousand connections at once. The tests (like the
+relay and the daemon) raise their soft open-file limit themselves; where the
+hard limit is lower than that (some containers), raise it first, for example
+with `ulimit -n 4096`. On Linux the binary-level test also needs `lsof` for
+its socket check; with `WARREN_REQUIRE_LSOF=1` a missing `lsof` is a failure
+rather than a skipped check.
+
+CI (`.github/workflows/ci.yml`) runs formatting, clippy, the tests and the
+docs on Linux and macOS, and checks the minimum Rust version. Release
+binaries are built there with `--remap-path-prefix`, so they carry no paths
+from the build machine; build any binary you publish the same way.
 
 Protocol details: [docs/protocol.md](docs/protocol.md). Relay operations:
 [docs/relay.md](docs/relay.md).
