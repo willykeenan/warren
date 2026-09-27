@@ -456,7 +456,29 @@ mod windows {
     }
 
     pub fn touch_private(path: &Path) -> Result<()> {
-        open_private_append(path).map(|_| ())
+        // SQLite owns its data locking and may already have a read/write
+        // connection. This operation only checks metadata; unlike a policy
+        // read or retained log writer, it does not consume or append bytes.
+        // Permit concurrent data writes here only, while retaining all alias,
+        // ownership/DACL checks and denying delete/replacement sharing.
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+        let pinned = PinnedPath::new(path)?;
+        let file = match fs::OpenOptions::new()
+            .access_mode(
+                win::READ_CONTROL | win::FILE_READ_ATTRIBUTES | win::WRITE_DAC | win::WRITE_OWNER,
+            )
+            .share_mode(win::FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(win::FILE_FLAG_BACKUP_SEMANTICS | win::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&pinned.path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let sd = win::SecurityDescriptor::from_sddl(&sddl::private_file(&user()?))?;
+                win::create_private_file(&pinned.path, &sd, false)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        validate_read(&file, path)
     }
 
     /// True if only this account and LocalSystem have access to `path`, and
@@ -485,6 +507,56 @@ mod windows {
     #[cfg(test)]
     mod security_tests {
         use super::*;
+        #[test]
+        fn replacement_preserves_exact_names_at_every_alignment() {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("home");
+            make_private_dir(&dir).unwrap();
+            let names: Vec<_> = (0..16)
+                .map(|n| format!("{}-camera-\u{1f4f7}.json", "x".repeat(n)))
+                .collect();
+            for name in &names {
+                let path = dir.join(name);
+                write_private(&path, b"first").unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"first", "{name}");
+                write_private(&path, b"replacement").unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"replacement", "{name}");
+            }
+            let mut actual: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            let mut expected = names;
+            actual.sort();
+            expected.sort();
+            assert_eq!(
+                actual, expected,
+                "no truncated, extended or temporary names"
+            );
+        }
+
+        #[test]
+        fn metadata_touch_allows_database_writers_without_relaxing_policy_reads() {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("home");
+            make_private_dir(&dir).unwrap();
+            let path = dir.join("database");
+            touch_private(&path).unwrap();
+            let writer = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            touch_private(&path).unwrap();
+            assert!(read_private(&path).is_err());
+            assert!(open_private_append(&path).is_err());
+            drop(writer);
+            let owner = user().unwrap();
+            set_security_for_test(&path, &format!("O:{owner}D:P(A;;FA;;;{owner})(A;;FW;;;WD)"))
+                .unwrap();
+            assert!(touch_private(&path).is_err(), "shared ACL is still refused");
+        }
+
         #[test]
         fn retained_data_and_ancestor_handles_reject_replacement() {
             let t = tempfile::tempdir().unwrap();

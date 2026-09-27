@@ -461,7 +461,14 @@ pub fn replace_file(file: &std::fs::File, destination: &std::path::Path) -> io::
     use windows_sys::Win32::Storage::FileSystem::{
         FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
     };
-    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    // FileNameLength excludes the terminator, but the Win32 path conversion
+    // still requires a NUL-terminated FileName. Do not rely on allocation
+    // padding: for some name lengths there is none.
+    let name: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let bytes = offset + name.len() * 2;
     let mut buffer = vec![
@@ -476,8 +483,12 @@ pub fn replace_file(file: &std::fs::File, destination: &std::path::Path) -> io::
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = ptr::null_mut();
-        (*info).FileNameLength = (name.len() * 2) as u32;
-        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        (*info).FileNameLength = ((name.len() - 1) * 2) as u32;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
         check(SetFileInformationByHandle(
             file.as_raw_handle(),
             FileRenameInfo,
