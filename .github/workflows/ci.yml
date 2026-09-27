@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The binary-level test checks the running processes' sockets with lsof.
+      WARREN_REQUIRE_LSOF: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install lsof
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lsof
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - run: cargo check --all-targets --locked
+
+  # Release binaries, built on a fresh runner with build paths remapped so
+  # they name no directory of the machine that built them.
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, msrv]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          # The encoded form (flags separated by 0x1f) allows spaces in paths.
+          export CARGO_ENCODED_RUSTFLAGS="$(printf -- '--remap-path-prefix=%s=/build\x1f--remap-path-prefix=%s=/warren' "$HOME" "$PWD")"
+          cargo build --release --locked
+      - name: Check that no build path is embedded
+        run: |
+          if strings target/release/warren | grep -F -e "$HOME" -e "$PWD"; then
+            echo "build paths found in the binary" >&2
+            exit 1
+          fi
+      - run: tar -czf warren-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/release warren
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-${{ matrix.target }}
+          path: warren-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
