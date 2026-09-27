@@ -188,31 +188,15 @@ impl RelayInner {
             l.out.close();
         }
         // Certificates for custom domains and published names.
-        match (&self.cfg.tls, &self.acme) {
-            (TlsMode::SelfSigned, _) => {
-                for h in hosts {
-                    if !self.resolver.has_host(&h) {
-                        if let Ok((c, k)) =
-                            crate::tls::generate_self_signed(std::slice::from_ref(&h))
-                        {
-                            if let Ok(ck) =
-                                crate::tls::certified_key_from_pem(c.as_bytes(), k.as_bytes())
-                            {
-                                self.resolver.set_host(&h, ck);
-                            }
-                        }
-                    }
-                }
+        // ACME: one certificate per published name and custom domain,
+        // issued on first claim.
+        if let Some(acme) = &self.acme {
+            for h in hosts {
+                acme.ensure(h);
             }
-            (TlsMode::Acme { .. }, Some(acme)) => {
-                for h in hosts {
-                    acme.ensure(h);
-                }
-                for n in pub_names {
-                    acme.ensure(format!("{n}.{}", self.cfg.publish_domain));
-                }
+            for n in pub_names {
+                acme.ensure(format!("{n}.{}", self.cfg.publish_domain));
             }
-            _ => {}
         }
         Ok(())
     }

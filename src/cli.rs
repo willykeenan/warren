@@ -981,9 +981,10 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             tokio::pin!(up);
             tokio::pin!(down);
             // Finish when the remote side closes; stdin EOF only half-closes.
+            let mut up_done = false;
             let res = loop {
                 tokio::select! {
-                    _ = &mut up => {}
+                    _ = &mut up, if !up_done => up_done = true,
                     r = &mut down => break r,
                 }
             };

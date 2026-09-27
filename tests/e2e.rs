@@ -1205,3 +1205,45 @@ async fn json_outputs_have_no_secrets() {
         }
     }
 }
+
+/// Custom domains configured by the relay operator route to a published name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_domain_routes_to_published_name() {
+    let relay = start_relay().await;
+    let b = enroll_started(&relay, "b").await;
+    let web = http_backend().await;
+    b.ctl_ok(ControlRequest::Publish {
+        port: web,
+        name: "web".into(),
+        replace: false,
+        allow: vec![],
+    })
+    .await;
+    // What `warren relay domain add app.example.org web` does, against the
+    // running relay's state file.
+    let admin = warren::relay::db::Db::open(&relay.state_dir()).unwrap();
+    admin.add_domain("App.Example.org", "web").unwrap();
+    wait_for("domain reload", Duration::from_secs(5), || {
+        relay.h().inner.route_public("app.example.org").as_deref() == Some("web")
+    })
+    .await;
+    let tls = tls_connect(&relay, "app.example.org").await;
+    let (rd, mut w) = tokio::io::split(tls);
+    let mut rc = warren::http::BufConn::new(rd, None);
+    w.write_all(b"GET /headers HTTP/1.1\r\nHost: app.example.org\r\n\r\n")
+        .await
+        .unwrap();
+    let (code, _, body) = read_response(&mut rc).await;
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["host"], serde_json::json!(["app.example.org"]));
+    // Unknown hosts get nothing.
+    let tls = tls_connect(&relay, "unknown.example.org").await;
+    let (rd, mut w) = tokio::io::split(tls);
+    let mut rc = warren::http::BufConn::new(rd, None);
+    w.write_all(b"GET / HTTP/1.1\r\nHost: unknown.example.org\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut rc).await.0, 404);
+    assert!(admin.remove_domain("app.example.org").unwrap());
+}

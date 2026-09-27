@@ -196,12 +196,9 @@ pub fn normalize_code(input: &str) -> Option<String> {
     }
 }
 
-/// The only form in which codes are stored.
+/// The only form in which codes are stored: SHA-256 of the normalized code.
 pub fn hash_code(code: &str) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"warren-v1-invite");
-    h.update(code.as_bytes());
-    h.finalize().into()
+    Sha256::digest(code.as_bytes()).into()
 }
 
 /// Constant-time byte comparison.
@@ -273,6 +270,10 @@ mod tests {
         assert_eq!(normalize_code("ABCDEFGHJ"), None);
         assert_eq!(normalize_code("ABCDEFGHJ0"), None);
         assert_ne!(hash_code("ABCDEFGHJK"), hash_code("ABCDEFGHJM"));
+        assert_eq!(
+            hex::encode(hash_code("ABCDEFGHJK")),
+            sha256_hex(b"ABCDEFGHJK")
+        );
     }
 
     #[test]
