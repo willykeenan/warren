@@ -331,6 +331,7 @@ pub struct DaemonInner {
     lookup_lock: tokio::sync::Mutex<()>,
     pub shutdown: CancellationToken,
     gateway: Arc<super::gateway::GatewayRuntime>,
+    private_services: Arc<super::private_service::PrivateServices>,
 }
 
 /// A running daemon.
@@ -384,6 +385,8 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         ident.name.clone(),
         relay.clone(),
     )?;
+    let private_services =
+        super::private_service::PrivateServices::new(paths.clone(), id.clone(), ident.name.clone());
     let inner = Arc::new(DaemonInner {
         cfg,
         ident,
@@ -404,10 +407,16 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         lookup_lock: tokio::sync::Mutex::new(()),
         shutdown: CancellationToken::new(),
         gateway,
+        private_services,
     });
 
     let listener = ipc::bind(&paths).await?;
     let mut tasks = Vec::new();
+    {
+        let services = inner.private_services.clone();
+        let stop = inner.shutdown.clone();
+        tasks.push(tokio::spawn(async move { services.watch(stop).await }));
+    }
     {
         let g = inner.gateway.clone();
         let stop = inner.shutdown.clone();
@@ -442,6 +451,37 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
 }
 
 impl DaemonInner {
+    /// Install an in-process service for a previously explicitly trusted exact peer key.
+    pub async fn register_private_service(
+        &self,
+        port: u16,
+        peer: &str,
+        expected_key: [u8; 32],
+        handler: Arc<dyn super::private_service::PrivateServiceHandler>,
+    ) -> Result<super::private_service::ServiceRegistration> {
+        let _guard = self.private_services.mutation.lock().await;
+        if self.shutdown.is_cancelled()
+            || self
+                .publishes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.port == port)
+        {
+            anyhow::bail!("private service unavailable or port publicly published");
+        }
+        self.private_services
+            .register(port, peer, expected_key, handler)
+    }
+
+    /// Return only after pending handshakes and active handlers have dropped their streams.
+    pub async fn revoke_private_service(
+        &self,
+        registration: &super::private_service::ServiceRegistration,
+    ) -> Result<()> {
+        self.private_services.revoke(registration).await
+    }
+
     pub fn current(&self) -> Option<Arc<Session>> {
         self.session.borrow().clone()
     }
@@ -695,6 +735,10 @@ impl DaemonInner {
         };
         if p.is_gateway() {
             self.gateway.spawn(p, tx, rx);
+            return;
+        }
+        if !p.is_public() && self.private_services.reserved(p.port) {
+            self.private_services.spawn(p, tx, rx);
             return;
         }
         let d = self.clone();
@@ -1208,6 +1252,13 @@ impl DaemonInner {
         match req {
             ControlRequest::Status => ControlResponse::ok(self.status_json()),
             ControlRequest::ShareSet { port, to } => {
+                let _guard = self.private_services.mutation.lock().await;
+                if self.private_services.reserved(port) {
+                    return ControlResponse::err(
+                        "service_reserved",
+                        "port is reserved for an in-process private service",
+                    );
+                }
                 match self.gateway.mutate_local(port, to, false).await {
                     Ok(_) => ControlResponse::ok(json!({"port":port})),
                     Err(e) => ControlResponse::err("share_policy", e.to_string()),
@@ -1289,6 +1340,13 @@ impl DaemonInner {
                 replace,
                 allow,
             } => {
+                let _guard = self.private_services.mutation.lock().await;
+                if self.private_services.reserved(port) {
+                    return ControlResponse::err(
+                        "service_reserved",
+                        "port is reserved for an in-process private service",
+                    );
+                }
                 let Some(session) = self.wait_session(SESSION_WAIT).await else {
                     return ControlResponse::err("not_connected", "not connected to the relay");
                 };

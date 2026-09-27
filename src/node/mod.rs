@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod framed;
 pub mod gateway;
 pub mod ipc;
+pub mod private_service;
 
 use crate::crypto::{self, Identity};
 use crate::fsutil;
