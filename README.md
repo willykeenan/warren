@@ -138,6 +138,10 @@ warren unpublish web
 Every command accepts `--json` for machine-readable output. Shares, forwards
 and publishes persist across restarts.
 
+Nodes run on macOS and Linux. On Linux, systemd user services run only while
+you are logged in; on a headless machine run `loginctl enable-linger $USER`
+once so `warren up` starts at boot.
+
 ### Exit codes
 
 | code | meaning |
@@ -264,8 +268,8 @@ on one host, TLS + Noise, `cargo test --release --test bench -- --ignored
 
 | measurement | result |
 |---|---|
-| private link throughput | ~1.9 Gbit/s |
-| added median round-trip latency | ~0.07 ms |
+| private link throughput | 1.6 to 1.9 Gbit/s |
+| added median round-trip latency | 0.07 to 0.08 ms |
 
 ## Development
 

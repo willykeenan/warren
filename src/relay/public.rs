@@ -15,7 +15,7 @@ use crate::proto::ErrorCode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 type ServerTls = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
@@ -40,16 +40,6 @@ enum ReqInfo {
     Reject(Vec<u8>),
 }
 
-async fn reply_close<W: AsyncWrite + Unpin>(w: &mut W, code: u16, reason: &str, body: &str) {
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = w
-            .write_all(&simple_response(code, reason, body, true))
-            .await;
-        let _ = w.shutdown().await;
-    })
-    .await;
-}
-
 /// Serve one public client connection whose first request is `first`.
 pub async fn serve(
     inner: Arc<RelayInner>,
@@ -62,11 +52,14 @@ pub async fn serve(
 ) {
     let publish = inner.registry.read().unwrap().publishes.get(&name).cloned();
     let Some(publish) = publish else {
-        reply_close(
+        super::write_and_close(
             &mut conn.inner,
-            404,
-            "Not Found",
-            "nothing is published under this name\n",
+            &simple_response(
+                404,
+                "Not Found",
+                "nothing is published under this name\n",
+                true,
+            ),
         )
         .await;
         return;
@@ -78,16 +71,23 @@ pub async fn serve(
                 .unwrap_or(false)
         });
         if !allowed {
-            reply_close(&mut conn.inner, 403, "Forbidden", "forbidden\n").await;
+            super::write_and_close(
+                &mut conn.inner,
+                &simple_response(403, "Forbidden", "forbidden\n", true),
+            )
+            .await;
             return;
         }
     }
     let Some(link) = inner.link_for(&publish.node_id) else {
-        reply_close(
+        super::write_and_close(
             &mut conn.inner,
-            502,
-            "Bad Gateway",
-            "the publishing machine is offline\n",
+            &simple_response(
+                502,
+                "Bad Gateway",
+                "the publishing machine is offline\n",
+                true,
+            ),
         )
         .await;
         return;
@@ -100,11 +100,14 @@ pub async fn serve(
                 ErrorCode::TooManyStreams | ErrorCode::RateLimited => (503, "Service Unavailable"),
                 _ => (502, "Bad Gateway"),
             };
-            reply_close(
+            super::write_and_close(
                 &mut conn.inner,
-                status,
-                reason,
-                "the published service is unavailable\n",
+                &simple_response(
+                    status,
+                    reason,
+                    "the published service is unavailable\n",
+                    true,
+                ),
             )
             .await;
             return;
