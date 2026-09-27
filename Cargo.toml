@@ -1,0 +1,52 @@
+[package]
+name = "warren"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Private links between your machines through a relay you run yourself"
+license = "MIT"
+authors = ["willykeenan <214437836+willykeenan@users.noreply.github.com>"]
+readme = "README.md"
+keywords = ["tunnel", "relay", "noise", "ssh", "proxy"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "warren"
+path = "src/lib.rs"
+
+[[bin]]
+name = "warren"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+httparse = "1"
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
+ipnet = "2"
+rand = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+snow = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = false
