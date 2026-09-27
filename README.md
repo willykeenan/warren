@@ -1,6 +1,14 @@
-# warren
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/logo-lockup-light.svg">
+    <img alt="warren" src="docs/brand/logo-lockup-light.svg" width="312" height="72">
+  </picture>
+</h1>
 
 Private links between your machines, through a relay you run yourself.
+
+Also on Hugging Face: https://huggingface.co/spaces/willykeenan/warren
 
 `warren` is one Rust binary. Enroll each of your machines with a relay you
 host on any small server with a public IP, and every machine can reach the
