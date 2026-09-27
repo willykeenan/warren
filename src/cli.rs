@@ -737,6 +737,30 @@ pub fn proxy_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''").replace('%', "%%"))
 }
 
+/// Check a `warren ssh` destination, `[USER@]NODE`. ssh substitutes NODE
+/// into the ProxyCommand (`%h`), so it must be a node name; neither part may
+/// look like an ssh option or contain spaces or control characters.
+pub fn check_ssh_destination(destination: &str) -> Result<(), String> {
+    let (user, node) = match destination.rsplit_once('@') {
+        Some((u, n)) => (Some(u), n),
+        None => (None, destination),
+    };
+    if !crate::valid_name(node) || node.starts_with('-') {
+        return Err(format!(
+            "invalid destination {destination:?}: use [USER@]NODE, where NODE is a machine name ([a-z0-9-])"
+        ));
+    }
+    if let Some(u) = user {
+        if u.is_empty()
+            || u.starts_with('-')
+            || u.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!("invalid user name {u:?} in {destination:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// Arguments for `warren ssh`.
 pub fn ssh_args(exe: &str, destination: &str, port: u16, extra: &[String]) -> Vec<String> {
     let mut v = vec![
@@ -1097,6 +1121,8 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             port,
             args,
         } => {
+            check_ssh_destination(&destination)
+                .map_err(|m| CliError::new(exit::USAGE, "usage", m))?;
             let exe = std::env::current_exe()
                 .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
             let argv = ssh_args(&exe.to_string_lossy(), &destination, port, &args);
@@ -1327,6 +1353,30 @@ mod tests {
         );
         assert_eq!(a[2], "me@b");
         assert_eq!(a[3], "-v");
+    }
+
+    #[test]
+    fn ssh_destinations() {
+        for ok in ["b", "laptop-2", "me@b", "first.last@b", "me@example.org@b"] {
+            assert!(check_ssh_destination(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "B",
+            "b;id",
+            "b$(id)",
+            "b c",
+            "-v",
+            "-oProxyCommand=x",
+            "me@-v",
+            "@b",
+            "-l@b",
+            "me x@b",
+            "me\n@b",
+            "me@",
+        ] {
+            assert!(check_ssh_destination(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
