@@ -364,7 +364,9 @@ mod tests {
         let raw = task_xml(&opts, "S-1-5-21-1-2-3-1001");
         let body = String::from_utf16(
             &raw[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect::<Vec<_>>(),
         )
@@ -457,7 +459,9 @@ mod tests {
         assert_eq!(&b[..2], &[255, 254]);
         let body = String::from_utf16(
             &b[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect::<Vec<_>>(),
         )

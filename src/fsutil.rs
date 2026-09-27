@@ -459,6 +459,29 @@ mod windows {
         open_private_append(path).map(|_| ())
     }
 
+    /// True if only this account and LocalSystem have access to `path`, and
+    /// it is owned by one of them (or by the account new files are created
+    /// as, which is BUILTIN\Administrators in an elevated process).
+    pub fn is_private(path: &Path) -> Result<bool> {
+        let f = open_meta(path, 0).with_context(|| format!("opening {}", path.display()))?;
+        Ok(assess(&f, path)?.is_private())
+    }
+
+    /// The owner and DACL of `path` as SDDL (for tests and diagnostics).
+    pub fn security_of(path: &Path) -> Result<String> {
+        let f = open_meta(path, 0).with_context(|| format!("opening {}", path.display()))?;
+        win::security_sddl(&f, win::Object::File).map_err(|e| acl_error(e, path))
+    }
+
+    /// Replace the security descriptor of `path` (for tests that need a
+    /// loosened directory or file).
+    #[doc(hidden)]
+    pub fn set_security_for_test(path: &Path, sddl_text: &str) -> Result<()> {
+        let f = open_meta(path, win::WRITE_DAC | win::WRITE_OWNER)
+            .with_context(|| format!("opening {}", path.display()))?;
+        win::apply_sddl(&f, sddl_text).map_err(|e| acl_error(e, path))
+    }
+
     #[cfg(test)]
     mod security_tests {
         use super::*;
@@ -499,29 +522,6 @@ mod windows {
             drop(writer);
             assert_eq!(read_private(&path).unwrap(), b"1");
         }
-    }
-
-    /// True if only this account and LocalSystem have access to `path`, and
-    /// it is owned by one of them (or by the account new files are created
-    /// as, which is BUILTIN\Administrators in an elevated process).
-    pub fn is_private(path: &Path) -> Result<bool> {
-        let f = open_meta(path, 0).with_context(|| format!("opening {}", path.display()))?;
-        Ok(assess(&f, path)?.is_private())
-    }
-
-    /// The owner and DACL of `path` as SDDL (for tests and diagnostics).
-    pub fn security_of(path: &Path) -> Result<String> {
-        let f = open_meta(path, 0).with_context(|| format!("opening {}", path.display()))?;
-        win::security_sddl(&f, win::Object::File).map_err(|e| acl_error(e, path))
-    }
-
-    /// Replace the security descriptor of `path` (for tests that need a
-    /// loosened directory or file).
-    #[doc(hidden)]
-    pub fn set_security_for_test(path: &Path, sddl_text: &str) -> Result<()> {
-        let f = open_meta(path, win::WRITE_DAC | win::WRITE_OWNER)
-            .with_context(|| format!("opening {}", path.display()))?;
-        win::apply_sddl(&f, sddl_text).map_err(|e| acl_error(e, path))
     }
 }
 
