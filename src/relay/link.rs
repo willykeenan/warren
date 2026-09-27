@@ -253,7 +253,7 @@ impl NodeLink {
         f: Frame,
     ) -> Result<(), &'static str> {
         let s = f.stream;
-        if s % 2 == 0 {
+        if s.is_multiple_of(2) {
             return Err("node used an even stream id");
         }
         if self.table.lock().unwrap().contains_key(&s) {

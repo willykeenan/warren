@@ -1,14 +1,19 @@
 [package]
 name = "warren"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Private links between your machines through a relay you run yourself"
 license = "MIT"
 authors = ["willykeenan <214437836+willykeenan@users.noreply.github.com>"]
+repository = "https://github.com/willykeenan/warren"
+homepage = "https://github.com/willykeenan/warren"
 readme = "README.md"
-keywords = ["tunnel", "relay", "noise", "ssh", "proxy"]
+keywords = ["relay", "noise", "ssh", "port-forwarding", "self-hosted"]
 categories = ["command-line-utilities", "network-programming"]
+# The name `warren` is taken on crates.io by an unrelated crate; install from
+# the repository (see README). Rename the package before ever publishing it.
+publish = false
 
 [lib]
 name = "warren"

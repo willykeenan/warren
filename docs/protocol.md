@@ -87,7 +87,7 @@ it. The relay:
 ### Verdict
 
 ```json
-{"type":"welcome","node_id":"...","name":"laptop","publish_domain":"relay.example.com","relay_version":"1.0.0"}
+{"type":"welcome","node_id":"...","name":"laptop","publish_domain":"relay.example.com","relay_version":"0.1.0"}
 {"type":"joined","node_id":"...","name":"laptop","publish_domain":"relay.example.com"}
 {"type":"error","code":"invalid_code","message":"..."}
 ```

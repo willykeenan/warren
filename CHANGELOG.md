@@ -4,9 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 semantic versioning.
 
-## [1.0.0] - 2026-09-27
+## [0.1.0] - 2026-09-27
 
-First release.
+First release. See *Status and limitations* in the README for what has and
+has not been tested.
 
 ### Added
 
@@ -51,6 +52,16 @@ First release.
   recent errors), `--json` on every command (argument errors included),
   documented exit codes.
 - `warren install` / `uninstall`: launchd agent on macOS, systemd user unit on
-  Linux; crashes are restarted, `warren down` is not undone.
-  `warren join --force` refuses to run while the daemon is up.
+  Linux; crashes are restarted, `warren down` is not undone; a failed
+  `launchctl`/`systemctl` call removes a newly written service file and
+  explains what to do. `warren join --force` refuses to run while the daemon
+  is up.
 - Reconnection with jittered backoff from 1 s to 60 s.
+- The relay and the daemon raise their soft open-file limit at startup
+  (towards 65536, up to the hard limit) and say when it stays too low.
+- Clear errors for a `WARREN_HOME` too long for the control socket and for a
+  `--relay` host that is not the relay's `--domain`; `warren relay invite`
+  prints the certificate pin of a self-signed relay; `warren ssh` checks its
+  destination.
+
+[0.1.0]: https://github.com/willykeenan/warren/releases/tag/v0.1.0
