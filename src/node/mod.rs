@@ -16,6 +16,25 @@ use std::fmt;
 use std::path::PathBuf;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Longest Unix socket path this platform accepts (`sun_path` less its
+/// terminating NUL).
+pub const MAX_SOCKET_PATH: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
+
+/// The node home is too deep for its control socket.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "WARREN_HOME is too long for the control socket ({path} is {len} bytes; the limit is \
+     {MAX_SOCKET_PATH}): use a shorter WARREN_HOME"
+)]
+pub struct SocketPathTooLong {
+    pub path: String,
+    pub len: usize,
+}
+
 /// Locations of a node's files.
 #[derive(Debug, Clone)]
 pub struct NodePaths {
@@ -53,6 +72,19 @@ impl NodePaths {
     }
     pub fn socket(&self) -> PathBuf {
         self.home.join("warren.sock")
+    }
+    /// [`NodePaths::socket`], or an error saying the home is too long for a
+    /// Unix socket path.
+    pub fn checked_socket(&self) -> Result<PathBuf, SocketPathTooLong> {
+        let p = self.socket();
+        let len = p.as_os_str().len();
+        if len > MAX_SOCKET_PATH {
+            return Err(SocketPathTooLong {
+                path: p.display().to_string(),
+                len,
+            });
+        }
+        Ok(p)
     }
     pub fn logs(&self) -> PathBuf {
         self.home.join("logs")
@@ -355,6 +387,10 @@ pub async fn join(
             )));
         }
     }
+    // A home too long for the control socket could never run `warren up`.
+    paths
+        .checked_socket()
+        .map_err(|e| JoinError::Usage(e.to_string()))?;
     // A running daemon loaded the current identity at start and would keep
     // authenticating with it (revoked, after a re-enrollment) forever.
     if control::daemon_running(paths).await {
@@ -486,6 +522,30 @@ pub fn sanitize_name(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_socket_path_length() {
+        let ok = NodePaths::new("/tmp/w");
+        assert_eq!(ok.checked_socket().unwrap(), ok.socket());
+        let longest = NodePaths::new(
+            "/".to_string() + &"h".repeat(MAX_SOCKET_PATH - "/warren.sock".len() - 1),
+        );
+        assert!(longest.checked_socket().is_ok());
+        let deep = NodePaths::new(longest.home.join("x"));
+        let e = deep.checked_socket().unwrap_err();
+        assert_eq!(e.len, MAX_SOCKET_PATH + 2);
+        assert!(e.to_string().contains("use a shorter WARREN_HOME"), "{e}");
+        // The platform takes the longest path and refuses anything longer
+        // (the directories do not exist, so a usable path fails with NotFound).
+        let err = |p: &NodePaths| {
+            std::os::unix::net::UnixListener::bind(p.socket())
+                .unwrap_err()
+                .kind()
+        };
+        assert_eq!(err(&longest), std::io::ErrorKind::NotFound);
+        let one_more = NodePaths::new(format!("{}h", longest.home.display()));
+        assert_eq!(err(&one_more), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn share_policy_default_deny() {

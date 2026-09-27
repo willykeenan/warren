@@ -415,7 +415,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
 }
 
 async fn bind_control(paths: &NodePaths) -> Result<UnixListener> {
-    let sock = paths.socket();
+    let sock = paths.checked_socket()?;
     if sock.exists() {
         if UnixStream::connect(&sock).await.is_ok() {
             anyhow::bail!("warren is already running for {}", paths.home.display());

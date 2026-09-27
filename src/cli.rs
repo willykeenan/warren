@@ -286,6 +286,9 @@ impl From<ControlError> for CliError {
             ControlError::NotRunning => {
                 CliError::new(exit::NOT_RUNNING, "not_running", e.to_string())
             }
+            ControlError::SocketPath(_) => {
+                CliError::new(exit::ERROR, "home_too_long", e.to_string())
+            }
             _ => CliError::new(exit::ERROR, "control", e.to_string()),
         }
     }

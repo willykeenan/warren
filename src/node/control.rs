@@ -86,6 +86,8 @@ impl ControlResponse {
 pub enum ControlError {
     #[error("warren is not running here; start it with `warren up` (or `warren install`)")]
     NotRunning,
+    #[error(transparent)]
+    SocketPath(#[from] super::SocketPathTooLong),
     #[error("control socket: {0}")]
     Io(#[from] io::Error),
     #[error("malformed reply from the daemon")]
@@ -93,7 +95,7 @@ pub enum ControlError {
 }
 
 async fn connect(paths: &NodePaths) -> Result<UnixStream, ControlError> {
-    match UnixStream::connect(paths.socket()).await {
+    match UnixStream::connect(paths.checked_socket()?).await {
         Ok(s) => Ok(s),
         Err(e)
             if matches!(
@@ -153,7 +155,10 @@ pub async fn request(
 
 /// True if a daemon answers on this home's control socket.
 pub async fn daemon_running(paths: &NodePaths) -> bool {
-    paths.socket().exists() && UnixStream::connect(paths.socket()).await.is_ok()
+    let Ok(sock) = paths.checked_socket() else {
+        return false;
+    };
+    sock.exists() && UnixStream::connect(sock).await.is_ok()
 }
 
 /// Ask the daemon to open a private stream; on success returns the pipe.

@@ -8,16 +8,13 @@ use std::time::Duration;
 use warren::node::control::ControlRequest;
 use warren::relay::db::JoinOutcome;
 
-/// docs/relay.md: "To replace a machine's keys (e.g. a reinstall), revoke it,
-/// create an invite with `--name` for the same name and run
-/// `warren join --force` on the machine." On a machine where `warren up` (or
-/// the login service) is running, `join --force` succeeds and prints
-/// "next: `warren up`", but the running daemon keeps authenticating with the
-/// revoked identity forever (`warren up` then says it is already running).
-/// Either `join` must refuse while the daemon runs, or the daemon must pick
-/// up the new identity.
+/// docs/relay.md: to replace a machine's keys, revoke it, create an invite
+/// with `--name` for the same name, stop the daemon and run
+/// `warren join --force`. A running daemon loaded the old identity and would
+/// keep authenticating with the revoked keys, so `join --force` refuses while
+/// it runs and says why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_force_while_daemon_runs_leaves_it_on_revoked_keys() {
+async fn join_force_refuses_while_the_daemon_runs() {
     let relay = start_relay().await;
     let mut b = enroll_started(&relay, "b").await;
     let old_fp = b.ident().fingerprint();
@@ -30,44 +27,53 @@ async fn join_force_while_daemon_runs_leaves_it_on_revoked_keys() {
     let code = relay.invite(Some("b"));
     let joined =
         warren::node::join(&b.paths, &code, &relay.url(), None, Some(relay.pin), true).await;
-    match joined {
-        Err(e) => {
-            // Acceptable behaviour: refuse and say why.
-            assert!(
-                e.to_string().contains("running"),
-                "join --force failed for another reason: {e}"
-            );
-        }
-        Ok(f) => {
-            let new_fp = f.fingerprint();
-            assert_ne!(old_fp, new_fp);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-            loop {
-                let st = b.ctl_ok(ControlRequest::Status).await;
-                if st["node"]["fingerprint"] == new_fp.as_str()
-                    && st["connection"]["state"] == "connected"
-                {
-                    break;
-                }
-                if tokio::time::Instant::now() > deadline {
-                    panic!(
-                        "15 s after `join --force` the running daemon still uses the revoked \
-                         identity {old_fp} (new {new_fp}); status: {st}"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+    let e = joined.expect_err("join --force must refuse while the daemon runs");
+    assert!(
+        e.to_string().contains("running"),
+        "join --force failed for another reason: {e}"
+    );
+    assert_eq!(b.ident().fingerprint(), old_fp, "the identity is unchanged");
+    // Stopped, the same code enrolls new keys.
+    b.stop().await;
+    let f = warren::node::join(&b.paths, &code, &relay.url(), None, Some(relay.pin), true)
+        .await
+        .unwrap();
+    assert_ne!(f.fingerprint(), old_fp);
+    b.start_connected().await;
+    let st = b.ctl_ok(ControlRequest::Status).await;
+    assert_eq!(st["node"]["fingerprint"], f.fingerprint().as_str());
     b.stop().await;
 }
 
-/// `warren devices` must work on a relay with a few hundred machines. The
-/// relay answers with one CTRL frame whose payload is limited to 65535 bytes
-/// (`Frame::ctrl` never checks the size), so past roughly 230 enrolled nodes
-/// the reply is a malformed frame: the asking node's whole relay connection
-/// is dropped (resetting every forward and ssh session on it) and `devices`
-/// fails.
+/// A WARREN_HOME too long for a Unix socket path is refused with an
+/// explanation, by the daemon and by the CLI's control requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn too_long_home_is_explained() {
+    let relay = start_relay().await;
+    let a = enroll(&relay, "a").await;
+    let deep = a.dir.path().join("d".repeat(120));
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::copy(a.paths.identity(), deep.join("identity.json")).unwrap();
+    let paths = warren::node::NodePaths::new(&deep);
+    let cfg = warren::node::daemon::DaemonConfig::new(paths.clone());
+    let e = warren::node::daemon::start(cfg)
+        .await
+        .err()
+        .expect("the daemon cannot bind its control socket");
+    assert!(
+        format!("{e:#}").contains("use a shorter WARREN_HOME"),
+        "{e:#}"
+    );
+    let e = warren::node::control::request(&paths, &ControlRequest::Status)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("use a shorter WARREN_HOME"), "{e}");
+}
+
+/// `warren devices` works on a relay with a few hundred machines: the answer
+/// is paged, so no CTRL frame exceeds the 65535-byte payload limit, and the
+/// asking node's relay connection (with every forward and ssh session on it)
+/// stays up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn devices_with_a_few_hundred_enrolled_machines() {
     let relay = start_relay().await;
@@ -108,9 +114,9 @@ async fn devices_with_a_few_hundred_enrolled_machines() {
 
 /// README: "`warren down` | stop the running daemon", and `down` makes the
 /// daemon exit with status 0. The login service `warren install` writes
-/// restarts it unconditionally (launchd `KeepAlive` = true, systemd
-/// `Restart=always`), so on an installed machine `warren down` is undone
-/// within seconds.
+/// restarts the daemon only after a failure (launchd `KeepAlive` on
+/// unsuccessful exit, systemd `Restart=on-failure`), so `warren down` is not
+/// undone on an installed machine.
 #[test]
 fn installed_service_does_not_undo_warren_down() {
     use warren::install::{launchd_plist, systemd_unit, Flavor, InstallOptions};
