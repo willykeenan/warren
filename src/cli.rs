@@ -202,17 +202,20 @@ pub enum RelaySub {
         /// Name the enrolling machine must use.
         #[arg(long)]
         name: Option<String>,
+        /// State directory of the relay (default: $WARREN_HOME/relay or ~/.warren/relay).
         #[arg(long)]
         state: Option<PathBuf>,
     },
     /// List enrolled nodes.
     Nodes {
+        /// State directory of the relay (default: $WARREN_HOME/relay or ~/.warren/relay).
         #[arg(long)]
         state: Option<PathBuf>,
     },
     /// Revoke a node: it is disconnected and can no longer connect.
     Revoke {
         name: String,
+        /// State directory of the relay (default: $WARREN_HOME/relay or ~/.warren/relay).
         #[arg(long)]
         state: Option<PathBuf>,
     },
@@ -220,11 +223,13 @@ pub enum RelaySub {
     Domain {
         #[command(subcommand)]
         action: DomainAction,
+        /// State directory of the relay (default: $WARREN_HOME/relay or ~/.warren/relay).
         #[arg(long, global = true)]
         state: Option<PathBuf>,
     },
     /// Show relay state (certificate pin in self-signed mode).
     Info {
+        /// State directory of the relay (default: $WARREN_HOME/relay or ~/.warren/relay).
         #[arg(long)]
         state: Option<PathBuf>,
     },
