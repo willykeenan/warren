@@ -55,9 +55,74 @@ pub fn valid_publish_name(name: &str) -> bool {
     valid_name(name) && !name.starts_with('-') && !name.ends_with('-')
 }
 
+/// Longest text accepted from another machine or the relay for display.
+pub const MAX_REMOTE_TEXT: usize = 512;
+
+/// Make text that came from another machine or from the relay (refusal
+/// messages, control errors, names) safe to show on a terminal or in a log:
+/// control characters and invisible bidirectional/formatting characters are
+/// escaped (`\u{1b}`), and the text is cut at [`MAX_REMOTE_TEXT`] characters.
+pub fn sanitize_remote_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_REMOTE_TEXT));
+    for (i, c) in s.chars().enumerate() {
+        if i >= MAX_REMOTE_TEXT {
+            out.push_str("...");
+            break;
+        }
+        let invisible = matches!(
+            c,
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        );
+        if c.is_control() || invisible {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A machine-readable code received from a remote: kept if it looks like one
+/// of ours (`[a-z0-9_]{1,40}`), otherwise replaced by `"error"`.
+pub fn sanitize_remote_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 40
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        code.to_string()
+    } else {
+        "error".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_text_is_made_safe() {
+        let hostile = "\u{1b}]0;owned\u{7}\u{1b}[2Jok \u{202e}evil\u{200b}";
+        let s = sanitize_remote_text(hostile);
+        assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+        assert!(!s.contains('\u{202e}') && !s.contains('\u{200b}'));
+        assert!(s.contains("\\u{1b}") && s.contains("ok "));
+        assert_eq!(
+            sanitize_remote_text("port 22 is not shared"),
+            "port 22 is not shared"
+        );
+        assert_eq!(sanitize_remote_text("日本語"), "日本語");
+        let long = sanitize_remote_text(&"x".repeat(5000));
+        assert_eq!(long.len(), MAX_REMOTE_TEXT + 3);
+        assert_eq!(sanitize_remote_code("name_taken"), "name_taken");
+        assert_eq!(sanitize_remote_code("\u{1b}[2J"), "error");
+        assert_eq!(sanitize_remote_code(""), "error");
+    }
 
     #[test]
     fn names() {

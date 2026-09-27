@@ -39,7 +39,8 @@ impl Env {
         let mut c = Command::new(BIN);
         c.env("HOME", self.p("fakehome"))
             .env("WARREN_HOME", self.p(home))
-            .env("WARREN_LOG", "debug")
+            // The most verbose level: secrets must not appear even here.
+            .env("WARREN_LOG", "trace")
             .env("WARREN_LAUNCHD_DIR", self.p("launchd"))
             .env("WARREN_SYSTEMD_DIR", self.p("systemd"))
             .env_remove("XDG_CONFIG_HOME")
@@ -518,7 +519,7 @@ async fn binary_end_to_end() {
     for l in ["relay.log", "a.log", "b.log"] {
         logs.extend(std::fs::read(env.p(l)).unwrap());
     }
-    assert!(logs.len() > 500, "debug logs were produced");
+    assert!(logs.len() > 500, "trace logs were produced");
     everything.extend_from_slice(&logs);
     for home in ["a", "b"] {
         let id: serde_json::Value =

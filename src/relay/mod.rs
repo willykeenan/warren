@@ -51,6 +51,9 @@ pub struct RelayConfig {
     pub idle_timeout: Duration,
     pub ping_interval: Duration,
     pub revision_poll: Duration,
+    /// How long senders wait for room on a node link before that link is
+    /// considered stuck and closed.
+    pub link_stuck_timeout: Duration,
     /// Observer of every binary message the relay receives or sends on node links.
     pub tap: Option<Tap>,
 }
@@ -68,6 +71,7 @@ impl RelayConfig {
             idle_timeout: limits::PUBLIC_IDLE_TIMEOUT,
             ping_interval: Duration::from_secs(20),
             revision_poll: Duration::from_secs(1),
+            link_stuck_timeout: limits::LINK_STUCK_TIMEOUT,
             tap: None,
         }
     }

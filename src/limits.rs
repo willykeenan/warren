@@ -22,12 +22,51 @@ pub const JOIN_FAILURE_WINDOW: Duration = Duration::from_secs(600);
 pub const INVITE_TTL: Duration = Duration::from_secs(600);
 /// Time allowed for a node to complete the WebSocket upgrade and authentication.
 pub const NODE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
-/// A link whose outbound queue exceeds this many bytes is considered stuck and closed.
+/// Frames that are not flow-controlled (PING/PONG, WINDOW, CTRL, OPEN,
+/// OPEN_OK/OPEN_ERR, CLOSE) queued on one link beyond this many bytes mean the
+/// peer stopped reading while provoking replies: the link is closed.
+/// Flow-controlled DATA has its own budget (see [`NODE_LINK_DATA_BUDGET`] and
+/// [`RELAY_LINK_DATA_BUDGET`]) and makes senders wait instead.
 pub const MAX_LINK_QUEUE: usize = 64 * 1024 * 1024;
+/// DATA bytes a node queues toward the relay before its senders wait. Covers
+/// every stream sending a full window at once (1024 x 256 KiB plus frame
+/// headers), so senders that respect the windows never wait; only a peer that
+/// grants more credit than it consumes makes them wait.
+pub const NODE_LINK_DATA_BUDGET: usize =
+    crate::proto::MAX_STREAMS_PER_NODE * (crate::proto::STREAM_WINDOW as usize + 1024);
+/// DATA bytes the relay queues toward one node (forwarded private streams and
+/// public streams) before the senders feeding it wait. This bounds relay
+/// memory per node regardless of how much credit nodes grant.
+pub const RELAY_LINK_DATA_BUDGET: usize = 32 * 1024 * 1024;
+/// A destination link on the relay whose DATA queue makes no room for this
+/// long is considered stuck and closed (the sources feeding it are paused
+/// meanwhile, so this must stay well below the nodes' keepalive timeout).
+pub const LINK_STUCK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Stream opens a node paces itself to (a little below the relay's limit of
+/// [`crate::proto::MAX_OPENS_PER_SEC`], so network jitter never trips it).
+pub const NODE_OPENS_PER_SEC: u32 = 60;
+/// Burst of stream opens a node allows itself.
+pub const NODE_OPEN_BURST: u32 = 60;
 /// Maximum concurrent client connections on a relay (nodes and public).
 pub const MAX_CONNECTIONS: usize = 16384;
 /// Maximum concurrent connections from one client IP.
 pub const MAX_CONNECTIONS_PER_IP: usize = 256;
+
+// Checked at compile time: the budgets admit everything flow control allows
+// (every stream sending its whole window in maximal frames), and nodes pace
+// themselves under the relay's open rate.
+const _: () = {
+    use crate::proto::{
+        HEADER_LEN, MAX_OPENS_PER_SEC, MAX_PAYLOAD, MAX_STREAMS_PER_NODE, MAX_WS_MESSAGE,
+        STREAM_WINDOW,
+    };
+    let frames_per_window = (STREAM_WINDOW as usize).div_ceil(MAX_PAYLOAD);
+    let per_stream = STREAM_WINDOW as usize + frames_per_window * HEADER_LEN;
+    assert!(NODE_LINK_DATA_BUDGET >= MAX_STREAMS_PER_NODE * per_stream);
+    assert!(RELAY_LINK_DATA_BUDGET >= 64 * MAX_WS_MESSAGE);
+    assert!(NODE_OPENS_PER_SEC <= MAX_OPENS_PER_SEC);
+    assert!(NODE_OPEN_BURST <= MAX_OPENS_PER_SEC);
+};
 
 /// Classic token bucket.
 #[derive(Debug)]
@@ -53,14 +92,26 @@ impl TokenBucket {
     }
 
     pub fn try_take_at(&mut self, now: Instant) -> bool {
+        self.take_or_wait_at(now).is_ok()
+    }
+
+    /// Take a token, or say how long until one is available.
+    pub fn take_or_wait(&mut self) -> Result<(), Duration> {
+        self.take_or_wait_at(Instant::now())
+    }
+
+    pub fn take_or_wait_at(&mut self, now: Instant) -> Result<(), Duration> {
         let dt = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            true
+            Ok(())
+        } else if self.rate > 0.0 {
+            Err(Duration::from_secs_f64((1.0 - self.tokens) / self.rate)
+                .max(Duration::from_millis(1)))
         } else {
-            false
+            Err(Duration::from_secs(1))
         }
     }
 }
@@ -162,6 +213,21 @@ mod tests {
         let later = t0 + Duration::from_secs(5);
         let ok = (0..100).filter(|_| b.try_take_at(later)).count();
         assert_eq!(ok, 64);
+    }
+
+    #[test]
+    fn bucket_reports_wait() {
+        let t0 = Instant::now();
+        let mut b = TokenBucket::new(50, 2);
+        b.last = t0;
+        assert!(b.take_or_wait_at(t0).is_ok());
+        assert!(b.take_or_wait_at(t0).is_ok());
+        let w = b.take_or_wait_at(t0).unwrap_err();
+        assert!(
+            w > Duration::from_millis(15) && w <= Duration::from_millis(20),
+            "{w:?}"
+        );
+        assert!(b.take_or_wait_at(t0 + w).is_ok());
     }
 
     #[test]

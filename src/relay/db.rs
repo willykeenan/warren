@@ -54,6 +54,8 @@ pub enum ClaimOutcome {
     Updated,
     AlreadyYours,
     TakenByOther,
+    /// The claiming node is revoked (or unknown): it may not hold names.
+    NotActive,
 }
 
 pub struct Db {
@@ -351,6 +353,19 @@ impl Db {
         let allow = allow.join(",");
         self.with(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Checked in the same transaction as the insert: `revoke` deletes
+            // a node's publishes in its own transaction, so a revoked node can
+            // never end up owning a name nothing would release.
+            let active: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT revoked_at FROM nodes WHERE node_id = ?1",
+                    [node_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if !matches!(active, Some(None)) {
+                return Ok(ClaimOutcome::NotActive);
+            }
             let owner: Option<String> = tx
                 .query_row("SELECT node_id FROM publishes WHERE name = ?1", [name], |r| {
                     r.get(0)
@@ -543,39 +558,64 @@ mod tests {
             .is_err());
     }
 
+    /// Enroll a node and return its id.
+    fn enroll(db: &Db, name: &str, n: u8) -> String {
+        let code = db.create_invite(None, Duration::from_secs(600), 1).unwrap();
+        let (sp, xp) = keys(n);
+        match db.join(&code, Some(name), &sp, &xp, 1).unwrap() {
+            JoinOutcome::Joined(r) => r.node_id,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn publish_ownership() {
         let t = tempfile::tempdir().unwrap();
         let db = Db::open(t.path()).unwrap();
+        let n1 = enroll(&db, "one", 1);
+        let n2 = enroll(&db, "two", 2);
+        let (n1, n2) = (n1.as_str(), n2.as_str());
         assert_eq!(
-            db.claim_publish("web", "n1", &[], false, 1).unwrap(),
+            db.claim_publish("web", n1, &[], false, 1).unwrap(),
             ClaimOutcome::Claimed
         );
         assert_eq!(
-            db.claim_publish("web", "n1", &[], false, 1).unwrap(),
+            db.claim_publish("web", n1, &[], false, 1).unwrap(),
             ClaimOutcome::AlreadyYours
         );
         assert_eq!(
-            db.claim_publish("web", "n1", &["10.0.0.0/8".into()], true, 1)
+            db.claim_publish("web", n1, &["10.0.0.0/8".into()], true, 1)
                 .unwrap(),
             ClaimOutcome::Updated
         );
         assert_eq!(
-            db.claim_publish("web", "n2", &[], true, 1).unwrap(),
+            db.claim_publish("web", n2, &[], true, 1).unwrap(),
             ClaimOutcome::TakenByOther
         );
         assert_eq!(
-            db.claim_publish("web", "n2", &[], false, 1).unwrap(),
+            db.claim_publish("web", n2, &[], false, 1).unwrap(),
             ClaimOutcome::TakenByOther
         );
-        assert!(!db.unpublish("web", "n2").unwrap());
+        assert!(!db.unpublish("web", n2).unwrap());
         let p = db.publishes().unwrap();
         assert_eq!(p[0].allow, vec!["10.0.0.0/8".to_string()]);
-        assert!(db.unpublish("web", "n1").unwrap());
+        assert!(db.unpublish("web", n1).unwrap());
         assert_eq!(
-            db.claim_publish("web", "n2", &[], false, 1).unwrap(),
+            db.claim_publish("web", n2, &[], false, 1).unwrap(),
             ClaimOutcome::Claimed
         );
+        // A revoked node cannot claim names (revoke released its names).
+        assert!(db.revoke("two", 2).unwrap());
+        assert!(db.publishes().unwrap().is_empty());
+        assert_eq!(
+            db.claim_publish("web", n2, &[], true, 1).unwrap(),
+            ClaimOutcome::NotActive
+        );
+        assert_eq!(
+            db.claim_publish("web", "nunknown", &[], false, 1).unwrap(),
+            ClaimOutcome::NotActive
+        );
+        assert!(db.publishes().unwrap().is_empty());
         db.add_domain("App.Example.org", "web").unwrap();
         assert_eq!(
             db.domains().unwrap(),

@@ -413,6 +413,22 @@ async fn destination_default_deny() {
         ),
         "{e}"
     );
+    // Shared, but nothing listening: reported (end to end encrypted, after
+    // the handshake) as such.
+    let idle = free_port().await;
+    b.share(idle, None);
+    let e = a.d().inner.open_private("b", idle).await.err().unwrap();
+    assert!(
+        matches!(
+            e,
+            OpenError::Refused {
+                code: ErrorCode::ConnectFailed,
+                ..
+            }
+        ),
+        "{e}"
+    );
+    assert!(e.to_string().contains("nothing is listening"), "{e}");
     // Unknown and offline destinations.
     let e = a.d().inner.open_private("nobody", 22).await.err().unwrap();
     assert!(matches!(e, OpenError::NoSuchNode(_)), "{e}");
@@ -640,7 +656,7 @@ async fn key_change_requires_trust() {
         }
         other => panic!("expected KeyChanged, got {other}"),
     }
-    assert!(e.to_string().contains("warren trust b"));
+    assert!(e.to_string().contains("warren trust b --expect"), "{e}");
     // The forward refuses too (the connection is closed without data).
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", local))
         .await
@@ -659,6 +675,19 @@ async fn key_change_requires_trust() {
         .clone();
     assert_eq!(bdev["pin"], "changed");
 
+    // Replacing a pinned key needs the verified fingerprint.
+    let r = a
+        .ctl(ControlRequest::Trust {
+            name: "b".into(),
+            expect: None,
+        })
+        .await;
+    assert_eq!(r.code.as_deref(), Some("fingerprint_required"), "{r:?}");
+    assert!(
+        r.error.as_deref().unwrap_or("").contains(&new_fp),
+        "the refusal names the fingerprint to verify: {r:?}"
+    );
+    assert_eq!(bdev["trust"], format!("warren trust b --expect {new_fp}"));
     // trust with a wrong expected fingerprint is refused.
     let r = a
         .ctl(ControlRequest::Trust {
@@ -678,6 +707,114 @@ async fn key_change_requires_trust() {
     assert_eq!(t["current"], new_fp.as_str());
     assert_eq!(t["changed"], true);
     assert_eq!(echo_roundtrip(local, b"after trust").await, b"after trust");
+}
+
+/// Relay backpressure: a destination that stops reading makes the relay stop
+/// reading from the node feeding it, so its queue stays bounded and no link
+/// carrying legal traffic is torn down; only a destination that makes no
+/// progress at all for the stuck timeout is disconnected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_backpressure_bounds_queues_and_drops_only_stuck_links() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::Message;
+    use warren::limits::RELAY_LINK_DATA_BUDGET;
+
+    let relay = start_relay_with(|c| c.link_stuck_timeout = Duration::from_secs(4)).await;
+    let a = enroll(&relay, "a").await;
+    let b = enroll(&relay, "b").await;
+    let mut ra = RawNode::connect(&relay, &a).await;
+    // b accepts one stream, grants a huge window, then stops reading.
+    let mut wb = raw_ws(&relay).await;
+    let c = challenge(&mut wb).await;
+    let v = send_hello(
+        &mut wb,
+        &auth_hello(&b.identity(), &b.ident().node_id, &c, "127.0.0.1"),
+    )
+    .await;
+    assert!(matches!(v, RelayVerdict::Welcome { .. }), "{v:?}");
+    ra.send(open_frame(1, "b", 22)).await;
+    let open = loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), wb.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Binary(m) = m {
+            let f = Frame::decode(m).unwrap();
+            if f.ty == FrameType::Open {
+                break f;
+            }
+        }
+    };
+    let extra = 63 * 1024 * 1024;
+    wb.send(Message::Binary(Frame::open_ok(open.stream).encode()))
+        .await
+        .unwrap();
+    wb.send(Message::Binary(Frame::window(open.stream, extra).encode()))
+        .await
+        .unwrap();
+
+    let a_closed = ra.closed.clone();
+    let sent = std::sync::Arc::new(AtomicUsize::new(0));
+    let s2 = sent.clone();
+    let total = STREAM_WINDOW as usize + extra as usize;
+    let sender = tokio::spawn(async move {
+        loop {
+            let f = ra.next(Duration::from_secs(5)).await.expect("OPEN_OK");
+            if f.ty == FrameType::OpenOk {
+                break;
+            }
+        }
+        let chunk = bytes::Bytes::from(vec![7u8; MAX_PAYLOAD]);
+        for _ in 0..total / MAX_PAYLOAD {
+            ra.send(Frame::data(1, chunk.clone())).await;
+            s2.fetch_add(MAX_PAYLOAD, Ordering::SeqCst);
+        }
+        ra
+    });
+
+    let b_link = || {
+        relay
+            .h()
+            .inner
+            .online
+            .lock()
+            .unwrap()
+            .values()
+            .find(|l| l.name == "b")
+            .cloned()
+    };
+    wait_for("b's relay queue to fill", Duration::from_secs(15), || {
+        b_link().is_some_and(|l| l.out.queued_data() + MAX_WS_MESSAGE > RELAY_LINK_DATA_BUDGET)
+    })
+    .await;
+    // Paused, not dropped: the queue stays within its budget, the sender is
+    // held back, and both links are still up.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let q = b_link().expect("b still connected").out.queued_data();
+    assert!(q <= RELAY_LINK_DATA_BUDGET, "queue {q} exceeds the budget");
+    assert!(
+        sent.load(Ordering::SeqCst) < total,
+        "the sender was never paused"
+    );
+    assert!(!a_closed.load(Ordering::SeqCst));
+    assert!(relay.online().contains(&"a".to_string()));
+
+    // No progress at all for the stuck timeout: b is disconnected, a is not.
+    wait_for(
+        "the stuck link to be dropped",
+        Duration::from_secs(15),
+        || !relay.online().contains(&"b".to_string()),
+    )
+    .await;
+    let ra = tokio::time::timeout(Duration::from_secs(20), sender)
+        .await
+        .expect("the sender resumes once the stuck link is gone")
+        .unwrap();
+    assert!(!ra.is_closed(), "the source link was torn down");
+    assert!(relay.online().contains(&"a".to_string()));
+    drop(wb);
 }
 
 /// Publishing: HTTP keep-alive, chunked bodies, long-poll, WebSocket, and

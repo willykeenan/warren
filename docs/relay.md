@@ -16,17 +16,19 @@ warren relay --domain relay.example.com [certificate source] [options]
 |---|---|---|
 | `--domain HOST` | required | the relay's own host name; nodes use `https://HOST` and sign it into every login |
 | `--publish-domain DOMAIN` | `--domain` | published names live at `NAME.DOMAIN` |
-| `--listen ADDR` | `0.0.0.0:443` | TLS listener for nodes and published names |
+| `--listen ADDR` | `0.0.0.0:443` | TLS listener for nodes and published names (IPv4; see *DNS records* for IPv6) |
 | `--state DIR` | `$WARREN_HOME/relay` or `~/.warren/relay` | state directory (created `0700`) |
 | `--acme EMAIL` | | automatic certificates from an ACME CA (Let's Encrypt by default) |
 | `--acme-directory URL` | Let's Encrypt production | another ACME directory (e.g. a staging CA) |
-| `--http-listen ADDR` | `0.0.0.0:80` with `--acme` | plain-HTTP listener: ACME challenges, redirects to HTTPS |
+| `--http-listen ADDR` | `0.0.0.0:80` with `--acme` | plain-HTTP listener: ACME challenges, redirects to HTTPS (IPv4 by default) |
 | `--cert FILE --key FILE` | | a PEM certificate chain and key used for every name |
 | `--self-signed` | | a persistent self-signed certificate, for testing |
 | `--json` | | print the startup event as JSON |
 
-Exactly one certificate source is required. `WARREN_LOG=debug` makes the log
-more verbose; logs go to stderr.
+Exactly one certificate source is required. `WARREN_LOG=debug` makes
+warren's own log more verbose (libraries stay at `warn` at any setting, so
+enrollment codes and published traffic never reach the log); logs go to
+stderr.
 
 Nodes must be configured with the same host name as `--domain`: their login
 signatures cover it, which stops a signature made for one relay from being
@@ -43,6 +45,18 @@ relay.example.com.     AAAA   2001:db8::10          ; if the host has IPv6
 *.relay.example.com.   A      203.0.113.10          ; published names
 *.relay.example.com.   AAAA   2001:db8::10
 ```
+
+The default listeners are IPv4 only. If you publish AAAA records, make the
+relay listen on IPv6 too, or clients (and the ACME CA, which prefers IPv6)
+first hit a refused connection:
+
+```sh
+warren relay --domain relay.example.com --acme you@example.com \
+    --listen '[::]:443' --http-listen '[::]:80' --state /var/lib/warren
+```
+
+On Linux (with the default `net.ipv6.bindv6only=0`) an `[::]` listener also
+accepts IPv4. Without AAAA records, keep the defaults.
 
 Instead of the wildcard you can add one record per published name. With
 `--publish-domain apps.example.com`, the wildcard goes under
@@ -125,10 +139,20 @@ warren relay domain add HOST NAME   # custom domain for a published name
 warren relay info                   # counts and the self-signed pin
 ```
 
-Revoking a node also releases the names it published. To replace a machine's
-keys (e.g. a reinstall), revoke it, create an invite with `--name` for the
-same name and run `warren join --force` on the machine. Its peers will then
-refuse the new key until they run `warren trust NAME`.
+Revoking a node disconnects it at once (also a connection it is making at
+that moment) and releases the names it published; a revoked node can never
+claim names again. To replace a machine's keys (e.g. a reinstall):
+
+1. on the relay host: `warren relay revoke NAME`, then
+   `warren relay invite --name NAME`;
+2. on the machine: `warren down` (the running daemon loaded the old keys and
+   would keep using them, so `join` refuses to run while it is up), then
+   `warren join --force CODE --relay https://relay.example.com`, then start it
+   again with `warren up`, or `warren install` if it runs at login.
+
+Its peers will then refuse the new key until they check the new fingerprint
+(`warren status` on the machine shows it) and run
+`warren trust NAME --expect FINGERPRINT`.
 
 Enrollment codes are stored only as SHA-256 hashes. An IP address that fails 5
 enrollment attempts within 10 minutes is refused until the window passes.
@@ -188,7 +212,8 @@ and are `0600`.
 | stream opens per node | 64 per second |
 | WebSocket message (one frame) | 65 542 bytes |
 | per-stream window | 256 KiB per direction |
-| outbound queue per node | 64 MiB |
+| stream data queued toward a node | 32 MiB (senders feeding it wait; no progress for 20 s disconnects the node) |
+| other frames queued toward a node | 64 MiB |
 | public TLS handshake + request head | 10 s |
 | public idle connection | 5 min |
 | public request head | 32 KiB |

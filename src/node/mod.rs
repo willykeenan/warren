@@ -212,8 +212,21 @@ pub enum PinCheck {
 }
 
 impl KnownPeers {
+    /// Load the pin store. A file that cannot be parsed, or that holds an
+    /// entry whose key is not a valid key, is an error: callers must fail
+    /// closed rather than treat pinned peers as new.
     pub fn load(paths: &NodePaths) -> Result<KnownPeers> {
-        Ok(fsutil::read_json(&paths.known_peers())?.unwrap_or_default())
+        let path = paths.known_peers();
+        let k: KnownPeers = fsutil::read_json(&path)?.unwrap_or_default();
+        for (name, p) in &k.peers {
+            if crypto::parse_key32(&p.static_pub).is_none() {
+                bail!(
+                    "{}: the pinned key for {name:?} is not a valid key",
+                    path.display()
+                );
+            }
+        }
+        Ok(k)
     }
 
     pub fn save(&self, paths: &NodePaths) -> Result<()> {
@@ -222,14 +235,14 @@ impl KnownPeers {
     }
 
     pub fn check(&self, name: &str, key: &[u8; 32]) -> PinCheck {
-        match self
-            .peers
-            .get(name)
-            .and_then(|p| crypto::parse_key32(&p.static_pub))
-        {
-            None => PinCheck::New,
+        let Some(p) = self.peers.get(name) else {
+            return PinCheck::New;
+        };
+        match crypto::parse_key32(&p.static_pub) {
             Some(k) if crypto::ct_eq(&k, key) => PinCheck::Match,
             Some(k) => PinCheck::Changed { pinned: k },
+            // An entry that exists but cannot be read never counts as "new".
+            None => PinCheck::Changed { pinned: [0; 32] },
         }
     }
 
@@ -308,6 +321,12 @@ impl PublishesFile {
 pub enum JoinError {
     #[error("already enrolled as {0:?}; use --force to enroll again with new keys")]
     AlreadyEnrolled(String),
+    /// The daemon is running with the current identity and would keep using it.
+    #[error("warren is running for {0}; stop it first with `warren down`, run `warren join` again, then start it with `warren up` (or `warren install`)")]
+    DaemonRunning(String),
+    /// Invalid arguments, found before contacting the relay.
+    #[error("{0}")]
+    Usage(String),
     #[error("relay refused enrollment ({code}): {message}")]
     Refused { code: String, message: String },
     #[error("{0:#}")]
@@ -328,11 +347,18 @@ pub async fn join(
             return Err(JoinError::AlreadyEnrolled(existing.name));
         }
     }
-    let url = RelayUrl::parse(relay)?;
+    let url = RelayUrl::parse(relay).map_err(|e| JoinError::Usage(format!("{e:#}")))?;
     if let Some(n) = name {
         if !crate::valid_name(n) {
-            return Err(anyhow!("invalid name {n:?}: use [a-z0-9-]{{1,32}}").into());
+            return Err(JoinError::Usage(format!(
+                "invalid name {n:?}: use [a-z0-9-]{{1,32}}"
+            )));
         }
+    }
+    // A running daemon loaded the current identity at start and would keep
+    // authenticating with it (revoked, after a re-enrollment) forever.
+    if control::daemon_running(paths).await {
+        return Err(JoinError::DaemonRunning(paths.home.display().to_string()));
     }
     let code = crypto::normalize_code(code).ok_or_else(|| JoinError::Refused {
         code: "invalid_code".into(),
@@ -362,7 +388,12 @@ pub async fn join(
             name,
             publish_domain,
         } => (node_id, name, publish_domain),
-        RelayVerdict::Error { code, message } => return Err(JoinError::Refused { code, message }),
+        RelayVerdict::Error { code, message } => {
+            return Err(JoinError::Refused {
+                code: crate::sanitize_remote_code(&code),
+                message: crate::sanitize_remote_text(&message),
+            })
+        }
         RelayVerdict::Welcome { .. } => return Err(anyhow!("unexpected relay reply").into()),
     };
     let file = IdentityFile {
@@ -469,6 +500,37 @@ mod tests {
         assert!(s.remove(22));
         assert!(!s.remove(22));
         assert_eq!(s.decide(22, "a"), ShareDecision::NotShared);
+    }
+
+    #[test]
+    fn pin_store_fails_closed() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(t.path().join("w"));
+        let mut k = KnownPeers::default();
+        k.pin("b", &[1; 32], false);
+        k.save(&paths).unwrap();
+        assert!(KnownPeers::load(&paths).unwrap().pinned("b").is_some());
+        // Truncated file.
+        std::fs::write(paths.known_peers(), b"{\"relay\": \"https://x").unwrap();
+        assert!(KnownPeers::load(&paths).is_err());
+        // Parsable file with a broken key.
+        std::fs::write(
+            paths.known_peers(),
+            br#"{"relay":"https://x","peers":{"b":{"static_pub":"zz","first_seen":1}}}"#,
+        )
+        .unwrap();
+        assert!(KnownPeers::load(&paths).is_err());
+        // In memory, a broken entry is never "new".
+        let mut k = KnownPeers::default();
+        k.peers.insert(
+            "b".into(),
+            KnownPeer {
+                static_pub: "zz".into(),
+                first_seen: 1,
+                trusted_at: None,
+            },
+        );
+        assert!(matches!(k.check("b", &[1; 32]), PinCheck::Changed { .. }));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use super::db::{ClaimOutcome, JoinOutcome};
 use super::RelayInner;
 use crate::crypto;
-use crate::limits::{TokenBucket, NODE_AUTH_TIMEOUT};
+use crate::limits::{TokenBucket, NODE_AUTH_TIMEOUT, RELAY_LINK_DATA_BUDGET};
 use crate::mux::{self, LinkOut, MuxReceiver, MuxSender, Slot, StreamHost, TapDir};
 use crate::proto::*;
 use futures_util::{SinkExt, StreamExt};
@@ -22,6 +22,8 @@ type ServerTls = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
 /// Largest total credit the relay lets one direction of a forwarded stream hold.
 const MAX_FORWARD_CREDIT: i64 = 64 * 1024 * 1024;
+/// Most entries in one `devices` reply.
+const DEVICES_PAGE_MAX: usize = 128;
 
 /// One side of a forwarded stream.
 struct Side {
@@ -37,8 +39,13 @@ struct Pair {
     init: Side,
     /// The destination node (even stream id on its link).
     targ: Side,
+    /// Credit of the initiator's sending direction: none until the target
+    /// accepts (OPEN_OK), so nothing is queued toward a node for a stream
+    /// its share policy has not admitted.
     credit_init: AtomicI64,
     credit_targ: AtomicI64,
+    /// The target answered OPEN_OK.
+    accepted: AtomicBool,
     fin_init: AtomicBool,
     fin_targ: AtomicBool,
 }
@@ -65,6 +72,14 @@ impl Pair {
 enum Entry {
     Fwd(Arc<Pair>),
     Local(Slot),
+}
+
+/// A DATA frame the reader must hand to another link. The reader waits for
+/// room on that link before reading on (backpressure).
+pub(crate) struct Forward {
+    out: LinkOut,
+    link: Weak<NodeLink>,
+    frame: Frame,
 }
 
 /// An authenticated node connection.
@@ -115,10 +130,22 @@ impl NodeLink {
     }
 
     pub fn send_event(&self, event: &str, detail: serde_json::Value) {
-        self.out.send(Frame::ctrl(&CtrlEvent {
+        if let Ok(f) = Frame::ctrl(&CtrlEvent {
             event: event.to_string(),
             detail,
-        }));
+        }) {
+            self.out.send(f);
+        }
+    }
+
+    /// Still enrolled (not revoked)?
+    fn is_active(&self, inner: &RelayInner) -> bool {
+        inner
+            .registry
+            .read()
+            .unwrap()
+            .nodes
+            .contains_key(&self.node_id)
     }
 
     /// Open a relay-terminated public stream to this node.
@@ -171,8 +198,13 @@ impl NodeLink {
         }
     }
 
-    /// Handle one frame. `Err` closes the link.
-    fn on_frame(self: &Arc<Self>, inner: &Arc<RelayInner>, f: Frame) -> Result<(), &'static str> {
+    /// Handle one frame. `Err` closes the link; `Ok(Some(..))` is DATA the
+    /// caller must forward to another link.
+    fn on_frame(
+        self: &Arc<Self>,
+        inner: &Arc<RelayInner>,
+        f: Frame,
+    ) -> Result<Option<Forward>, &'static str> {
         match f.ty {
             FrameType::Ping => {
                 if f.stream != CONTROL_STREAM || f.payload.len() > 64 {
@@ -182,26 +214,35 @@ impl NodeLink {
                     self.out
                         .send(Frame::new(FrameType::Pong, CONTROL_STREAM, f.payload));
                 }
-                Ok(())
+                Ok(None)
             }
             FrameType::Pong => {
                 *self.last_pong.lock().unwrap() = Instant::now();
-                Ok(())
+                Ok(None)
             }
             FrameType::Ctrl => {
                 if f.stream != CONTROL_STREAM {
                     return Err("CTRL on a data stream");
                 }
+                // Defence in depth: a link that outlived its node's revocation
+                // gets nothing done (reload also disconnects it).
+                if !self.is_active(inner) {
+                    return Err("node revoked");
+                }
                 self.handle_ctrl(inner, &f.payload);
-                Ok(())
+                Ok(None)
             }
-            FrameType::Open => self.handle_open(inner, f),
+            FrameType::Open => {
+                if !self.is_active(inner) {
+                    return Err("node revoked");
+                }
+                self.handle_open(inner, f).map(|()| None)
+            }
             _ => {
                 if f.stream == CONTROL_STREAM {
                     return Err("stream frame on the control stream");
                 }
-                self.route(f);
-                Ok(())
+                Ok(self.route(f))
             }
         }
     }
@@ -271,8 +312,9 @@ impl NodeLink {
                     out: dlink.out.clone(),
                     id: t,
                 },
-                credit_init: AtomicI64::new(STREAM_WINDOW as i64),
+                credit_init: AtomicI64::new(0),
                 credit_targ: AtomicI64::new(STREAM_WINDOW as i64),
+                accepted: AtomicBool::new(false),
                 fin_init: AtomicBool::new(false),
                 fin_targ: AtomicBool::new(false),
             });
@@ -292,17 +334,17 @@ impl NodeLink {
         Ok(())
     }
 
-    fn route(self: &Arc<Self>, f: Frame) {
+    fn route(self: &Arc<Self>, f: Frame) -> Option<Forward> {
         let id = f.stream;
         let pair = {
             let mut t = self.table.lock().unwrap();
             match t.get_mut(&id) {
-                None => return,
+                None => return None,
                 Some(Entry::Local(slot)) => {
                     if slot.deliver(f, &self.out) {
                         t.remove(&id);
                     }
-                    return;
+                    return None;
                 }
                 Some(Entry::Fwd(p)) => p.clone(),
             }
@@ -311,6 +353,13 @@ impl NodeLink {
         let other = if from_init { &pair.targ } else { &pair.init };
         match f.ty {
             FrameType::Data => {
+                if from_init && !pair.accepted.load(Ordering::SeqCst) {
+                    // Nodes wait for OPEN_OK; nothing is queued toward a node
+                    // for a stream it has not accepted.
+                    tracing::debug!(node = %self.name, stream = id, "DATA before OPEN_OK");
+                    pair.reset_both(ErrorCode::Protocol);
+                    return None;
+                }
                 let credit = if from_init {
                     &pair.credit_init
                 } else {
@@ -320,14 +369,18 @@ impl NodeLink {
                 if credit.fetch_sub(n, Ordering::AcqRel) - n < 0 {
                     tracing::debug!(node = %self.name, stream = id, "window overrun");
                     pair.reset_both(ErrorCode::WindowOverrun);
-                    return;
+                    return None;
                 }
-                other.out.send(Frame::data(other.id, f.payload));
+                return Some(Forward {
+                    out: other.out.clone(),
+                    link: other.link.clone(),
+                    frame: Frame::data(other.id, f.payload),
+                });
             }
             FrameType::Window => {
                 let Ok(n) = f.window_credit() else {
                     pair.reset_both(ErrorCode::Protocol);
-                    return;
+                    return None;
                 };
                 // A WINDOW from one side grants credit to the other side's sending direction.
                 let credit = if from_init {
@@ -337,7 +390,7 @@ impl NodeLink {
                 };
                 if credit.fetch_add(n as i64, Ordering::AcqRel) + n as i64 > MAX_FORWARD_CREDIT {
                     pair.reset_both(ErrorCode::Protocol);
-                    return;
+                    return None;
                 }
                 other.out.send(Frame::window(other.id, n));
             }
@@ -360,7 +413,12 @@ impl NodeLink {
                 }
             },
             FrameType::OpenOk if !from_init => {
-                other.out.send(Frame::open_ok(other.id));
+                // Accepting grants the initiator its window, once.
+                if !pair.accepted.swap(true, Ordering::SeqCst) {
+                    pair.credit_init
+                        .fetch_add(STREAM_WINDOW as i64, Ordering::AcqRel);
+                    other.out.send(Frame::open_ok(other.id));
+                }
             }
             FrameType::OpenErr if !from_init => {
                 let (code, msg) = f.open_error();
@@ -369,6 +427,7 @@ impl NodeLink {
             }
             _ => {}
         }
+        None
     }
 
     fn handle_ctrl(self: &Arc<Self>, inner: &Arc<RelayInner>, payload: &[u8]) {
@@ -407,7 +466,23 @@ impl NodeLink {
                 result: serde_json::Value::Null,
             },
         };
-        self.out.send(Frame::ctrl(&resp));
+        match Frame::ctrl(&resp) {
+            Ok(f) => {
+                self.out.send(f);
+            }
+            Err(_) => {
+                let small = CtrlResponse {
+                    id,
+                    ok: false,
+                    error: Some("reply too large for one frame".into()),
+                    code: Some("too_large".into()),
+                    result: serde_json::Value::Null,
+                };
+                if let Ok(f) = Frame::ctrl(&small) {
+                    self.out.send(f);
+                }
+            }
+        }
     }
 
     fn ctrl_op(
@@ -417,7 +492,7 @@ impl NodeLink {
     ) -> Result<serde_json::Value, (&'static str, String)> {
         let internal = |e: anyhow::Error| ("internal", format!("{e:#}"));
         match op {
-            CtrlOp::Devices => Ok(serde_json::to_value(devices(inner)).unwrap_or_default()),
+            CtrlOp::Devices { offset, limit } => Ok(devices_page(inner, offset, limit)),
             CtrlOp::Lookup { name } => devices(inner)
                 .into_iter()
                 .find(|d| d.name == name)
@@ -447,6 +522,9 @@ impl NodeLink {
                     )
                     .map_err(internal)?;
                 match outcome {
+                    ClaimOutcome::NotActive => {
+                        Err(("revoked", "this node has been revoked".into()))
+                    }
                     ClaimOutcome::TakenByOther => Err((
                         "name_taken",
                         format!("{name:?} is published by another node"),
@@ -524,6 +602,32 @@ fn devices(inner: &RelayInner) -> Vec<DeviceInfo> {
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+/// One page of [`devices`] that fits in a single CTRL frame.
+fn devices_page(inner: &RelayInner, offset: usize, limit: Option<usize>) -> serde_json::Value {
+    let all = devices(inner);
+    let limit = limit.unwrap_or(DEVICES_PAGE_MAX).clamp(1, DEVICES_PAGE_MAX);
+    // Room for the response envelope around the list.
+    let budget = MAX_CTRL_PAYLOAD - 1024;
+    let mut used = 0;
+    let mut page = Vec::new();
+    for d in all.iter().skip(offset) {
+        let n = serde_json::to_vec(d).map_or(usize::MAX, |v| v.len() + 1);
+        if page.len() >= limit || used + n > budget {
+            break;
+        }
+        used += n;
+        page.push(d.clone());
+    }
+    let end = offset.saturating_add(page.len());
+    let next = (end < all.len() && !page.is_empty()).then_some(end);
+    serde_json::to_value(DevicesPage {
+        devices: page,
+        next,
+        total: all.len(),
+    })
+    .unwrap_or_default()
 }
 
 /// Validate and normalize an allowlist of CIDRs or bare addresses.
@@ -667,15 +771,7 @@ pub async fn serve_node(
         }
     };
 
-    let welcome = RelayVerdict::Welcome {
-        node_id: record.node_id.clone(),
-        name: record.name.clone(),
-        publish_domain: inner.cfg.publish_domain.clone(),
-        relay_version: crate::VERSION.to_string(),
-    };
-    send_verdict(&mut ws, &welcome).await;
-
-    let (out, rx) = LinkOut::new(CancellationToken::new());
+    let (out, rx) = LinkOut::with_data_budget(CancellationToken::new(), RELAY_LINK_DATA_BUDGET);
     let link = Arc::new(NodeLink {
         conn_id: inner.conn_id(),
         node_id: record.node_id.clone(),
@@ -690,18 +786,42 @@ pub async fn serve_node(
         next_even: AtomicU32::new(2),
         last_pong: Mutex::new(Instant::now()),
     });
-    if let Some(old) = inner
-        .online
-        .lock()
-        .unwrap()
-        .insert(record.node_id.clone(), link.clone())
-    {
-        old.out.close();
+    // Register the link, unless the node was revoked since its record was
+    // read above. The registry check and the insert happen under the
+    // `online` lock, and `reload` swaps the registry *before* taking that
+    // lock to disconnect revoked nodes, so every link either sees the new
+    // registry here or is disconnected by the reload.
+    let registered = {
+        let mut online = inner.online.lock().unwrap();
+        if link.is_active(&inner) {
+            if let Some(old) = online.insert(record.node_id.clone(), link.clone()) {
+                old.out.close();
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if !registered {
+        tracing::info!(%peer, node = %record.name, "node authentication refused: revoked");
+        send_verdict(
+            &mut ws,
+            &verdict_error("revoked", "this node has been revoked"),
+        )
+        .await;
+        return;
     }
     let cleanup = LinkCleanup {
         inner: inner.clone(),
         link: link.clone(),
     };
+    let welcome = RelayVerdict::Welcome {
+        node_id: record.node_id.clone(),
+        name: record.name.clone(),
+        publish_domain: inner.cfg.publish_domain.clone(),
+        relay_version: crate::VERSION.to_string(),
+    };
+    send_verdict(&mut ws, &welcome).await;
     let _ = inner.db.touch_last_seen(&record.node_id, crate::now_secs());
     tracing::info!(node = %record.name, %peer, "node connected");
 
@@ -715,7 +835,7 @@ pub async fn serve_node(
     let mut ping = tokio::time::interval(inner.cfg.ping_interval);
     ping.tick().await;
     let tap = inner.cfg.tap.clone();
-    let reason = loop {
+    let reason = 'serve: loop {
         tokio::select! {
             _ = out.token().cancelled() => break "link closed",
             _ = inner.shutdown.cancelled() => break "relay shutting down",
@@ -732,11 +852,38 @@ pub async fn serve_node(
                         t(TapDir::In, &b);
                     }
                     match Frame::decode(b) {
-                        Ok(f) => {
-                            if let Err(e) = link.on_frame(&inner, f) {
-                                break e;
+                        Ok(f) => match link.on_frame(&inner, f) {
+                            Err(e) => break e,
+                            Ok(None) => {}
+                            Ok(Some(fwd)) => {
+                                // Backpressure: read nothing more from this node
+                                // until the destination link has room. A
+                                // destination whose writer makes no progress at
+                                // all for the stuck timeout is disconnected.
+                                let stuck = inner.cfg.link_stuck_timeout;
+                                let waiting_since = std::time::Instant::now();
+                                let send = fwd.out.send_data(fwd.frame);
+                                tokio::pin!(send);
+                                loop {
+                                    tokio::select! {
+                                        _ = out.token().cancelled() => break 'serve "link closed",
+                                        _ = inner.shutdown.cancelled() => break 'serve "relay shutting down",
+                                        _ = &mut send => break,
+                                        _ = tokio::time::sleep((stuck / 8).max(Duration::from_millis(10))) => {
+                                            if fwd.out.stalled_for(waiting_since) >= stuck {
+                                                let dest = fwd.link.upgrade().map(|l| l.name.clone()).unwrap_or_default();
+                                                tracing::warn!(
+                                                    node = %dest,
+                                                    "outbound queue made no progress for {} s; disconnecting",
+                                                    stuck.as_secs()
+                                                );
+                                                fwd.out.close();
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
+                        },
                         Err(_) => break "malformed frame",
                     }
                 }

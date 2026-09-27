@@ -13,7 +13,7 @@
 //! | 6 | refused (not shared, forbidden, offline, unknown node, connect failed, limits) |
 //! | 7 | a pinned key changed, or a fingerprint did not match |
 //! | 8 | authentication or enrollment refused |
-//! | 9 | name conflict (publish) |
+//! | 9 | name conflict (publish, or the name asked for at join) |
 
 // Doc comments below double as `--help` text, which is plain text, not rustdoc.
 #![allow(
@@ -297,7 +297,8 @@ pub fn exit_for_code(code: &str) -> i32 {
         "not_connected" => exit::NOT_CONNECTED,
         "not_running" => exit::NOT_RUNNING,
         "not_enrolled" => exit::NOT_ENROLLED,
-        "key_changed" | "fingerprint_mismatch" => exit::KEY_CHANGED,
+        "key_changed" | "fingerprint_mismatch" | "fingerprint_required" => exit::KEY_CHANGED,
+        "usage" | "bad_request" => exit::USAGE,
         "name_taken" | "already_published" => exit::CONFLICT,
         "invalid_code" | "rate_limited_join" | "bad_signature" | "revoked" | "unknown_node"
         | "name_taken_join" => exit::AUTH,
@@ -332,14 +333,65 @@ impl Out {
     }
 }
 
+/// Log filter directives for `WARREN_LOG` (or `default` when unset).
+///
+/// The directives set the verbosity of warren's own messages only (a bare
+/// level such as `debug` means `warren=debug`; `warren::...` targets are kept
+/// as given). Every other crate stays at `warn` whatever `WARREN_LOG` says,
+/// because some libraries log whole protocol messages at debug and trace
+/// level, which would put enrollment codes and published HTTP traffic in the
+/// log.
+pub fn log_directives(spec: Option<&str>, default: &str) -> String {
+    let spec = spec
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default);
+    let mut out = vec!["warn".to_string()];
+    for d in spec.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        let target = d.split(['=', '[']).next().unwrap_or("");
+        if d.parse::<tracing_subscriber::filter::LevelFilter>().is_ok() {
+            out.push(format!("warren={d}"));
+        } else if target == "warren" || target.starts_with("warren::") {
+            out.push(d.to_string());
+        }
+    }
+    out.join(",")
+}
+
 fn init_logging(default: &str) {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("WARREN_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let spec = std::env::var("WARREN_LOG").ok();
+    let filter = tracing_subscriber::EnvFilter::try_new(log_directives(spec.as_deref(), default))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_directives(None, default)));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+/// Escape control characters (other than newlines and tabs) before text
+/// reaches the terminal.
+pub fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            let escape = (c.is_control() && c != '\n' && c != '\t')
+                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+            let v: Vec<char> = if escape {
+                c.escape_unicode().collect()
+            } else {
+                vec![c]
+            };
+            v
+        })
+        .collect()
+}
+
+/// `--json` appears among the options (not after `--`).
+fn wants_json<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> bool {
+    args.into_iter()
+        .skip(1)
+        .take_while(|a| a != "--")
+        .any(|a| a == "--json")
 }
 
 /// Entry point used by `main`.
@@ -353,7 +405,18 @@ pub fn main() -> i32 {
                 }
                 _ => exit::USAGE,
             };
-            let _ = e.print();
+            if code != exit::OK && wants_json(std::env::args_os()) {
+                let msg = e.render().to_string();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"ok": false, "code": "usage", "error": msg.trim()})
+                    )
+                    .unwrap_or_default()
+                );
+            } else {
+                let _ = e.print();
+            }
             return code;
         }
     };
@@ -381,7 +444,7 @@ pub fn main() -> i32 {
                     .unwrap_or_default()
                 );
             } else {
-                eprintln!("warren: {}", e.message);
+                eprintln!("warren: {}", terminal_safe(&e.message));
             }
             e.exit
         }
@@ -727,7 +790,7 @@ fn human_status(v: &Value) -> String {
     if !errs.is_empty() {
         s += "recent errors:\n";
         for e in errs.iter().rev().take(10) {
-            s += &format!("  {}\n", e["message"].as_str().unwrap_or(""));
+            s += &format!("  {}\n", terminal_safe(e["message"].as_str().unwrap_or("")));
         }
     }
     s
@@ -777,11 +840,15 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                     "already_enrolled",
                     format!("already enrolled as {n:?}; use --force to enroll again with new keys"),
                 )),
+                Err(e @ JoinError::DaemonRunning(_)) => {
+                    Err(CliError::new(exit::ERROR, "daemon_running", e.to_string()))
+                }
+                Err(JoinError::Usage(m)) => Err(CliError::new(exit::USAGE, "usage", m)),
                 Err(JoinError::Refused { code, message }) => {
-                    let exit = if code == "name_taken" || code == "bad_name" {
-                        exit::CONFLICT
-                    } else {
-                        exit::AUTH
+                    let exit = match code.as_str() {
+                        "name_taken" => exit::CONFLICT,
+                        "bad_name" => exit::USAGE,
+                        _ => exit::AUTH,
                     };
                     Err(CliError::new(exit, &code, message))
                 }
@@ -1080,6 +1147,18 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                         },
                     );
                 }
+                let changed: Vec<&Value> = v
+                    .as_array()
+                    .map(|a| a.iter().filter(|d| d["pin"] == "changed").collect())
+                    .unwrap_or_default();
+                for d in changed {
+                    s += &format!(
+                        "\n{} has a new key. If that is expected, compare the fingerprint above with `warren status` on {} itself, then run:\n  {}\n",
+                        d["name"].as_str().unwrap_or(""),
+                        d["name"].as_str().unwrap_or(""),
+                        d["trust"].as_str().unwrap_or("warren trust NAME --expect FINGERPRINT"),
+                    );
+                }
                 s
             });
             Ok(())
@@ -1229,11 +1308,36 @@ mod tests {
     }
 
     #[test]
+    fn log_filter_only_opens_warren_itself() {
+        assert_eq!(log_directives(None, "info"), "warn,warren=info");
+        assert_eq!(log_directives(Some("trace"), "info"), "warn,warren=trace");
+        assert_eq!(
+            log_directives(Some("debug,tungstenite=trace,warren::relay=trace"), "info"),
+            "warn,warren=debug,warren::relay=trace"
+        );
+        assert_eq!(log_directives(Some("  "), "warn"), "warn,warren=warn");
+        assert!(
+            tracing_subscriber::EnvFilter::try_new(log_directives(Some("trace"), "info")).is_ok()
+        );
+    }
+
+    #[test]
+    fn json_flag_detection_and_terminal_safety() {
+        let a = |v: &[&str]| wants_json(v.iter().map(std::ffi::OsString::from));
+        assert!(a(&["warren", "--json", "forward", "abc"]));
+        assert!(a(&["warren", "forward", "abc", "--json"]));
+        assert!(!a(&["warren", "ssh", "b", "--", "--json"]));
+        assert!(!a(&["--json"]));
+        assert_eq!(terminal_safe("a\u{1b}[2Jb\nc"), "a\\u{1b}[2Jb\nc");
+    }
+
+    #[test]
     fn exit_codes() {
         assert_eq!(exit_for_code("not_shared"), exit::REFUSED);
         assert_eq!(exit_for_code("key_changed"), exit::KEY_CHANGED);
         assert_eq!(exit_for_code("name_taken"), exit::CONFLICT);
         assert_eq!(exit_for_code("not_connected"), exit::NOT_CONNECTED);
+        assert_eq!(exit_for_code("fingerprint_required"), exit::KEY_CHANGED);
         assert_eq!(exit_for_code("whatever"), exit::ERROR);
         let _ = Cli::command();
     }

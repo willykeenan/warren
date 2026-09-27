@@ -128,7 +128,10 @@ pub fn launchd_plist(opts: &InstallOptions) -> String {
 {env}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
@@ -165,7 +168,7 @@ pub fn systemd_unit(opts: &InstallOptions) -> String {
         String::new()
     };
     format!(
-        "[Unit]\nDescription=warren node (private links between your machines)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} up\n{env}Restart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=warren node (private links between your machines)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} up\n{env}Restart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(&opts.exe.to_string_lossy())
     )
 }
@@ -324,7 +327,10 @@ mod tests {
         assert!(s.contains("<string>up</string>"));
         assert!(s.contains("<key>WARREN_HOME</key>"));
         assert!(s.contains("home &amp; &lt;x&gt;"));
-        assert!(s.contains("<key>KeepAlive</key>"));
+        // Crashes are restarted, a clean exit (`warren down`) is not.
+        assert!(s.contains(
+            "<key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>"
+        ));
         assert!(r.label.starts_with("dev.warren.node."));
         uninstall(&o).unwrap();
         assert!(!r.path.exists());
@@ -339,7 +345,8 @@ mod tests {
         assert_eq!(r.path, dir.join("warren.service"));
         let s = std::fs::read_to_string(&r.path).unwrap();
         assert!(s.contains("ExecStart=\"/opt/my tools/warren\" up"));
-        assert!(s.contains("Restart=always"));
+        assert!(s.contains("Restart=on-failure"));
+        assert!(!s.contains("Restart=always"));
         assert!(s.contains("WantedBy=default.target"));
         assert!(!s.contains("WARREN_HOME"));
         let o2 = opts(Flavor::Systemd, &dir, &t.path().join("h%1"), true);

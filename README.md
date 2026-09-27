@@ -21,7 +21,8 @@ also publish one local service on a public HTTPS name.
   `warren share PORT`, optionally only for named machines. The check happens
   on the destination, so even a compromised relay cannot open an unshared port.
 * **Keys are pinned.** Each machine remembers every peer's key the first time
-  it sees it and refuses a changed key until you run `warren trust NAME`.
+  it sees it and refuses a changed key until you verify the new fingerprint
+  and run `warren trust NAME --expect FINGERPRINT`.
 * **Everything rides one outbound WebSocket on port 443**, so it works behind
   NAT and strict firewalls.
 * **Publishing** (`warren publish 3230 --name web`) puts a local port at
@@ -45,11 +46,14 @@ relay.example.com.     A     203.0.113.10
 
 ### 2. Build
 
-On each machine (Rust 1.85 or newer):
+With Rust 1.85 or newer, on the relay host install the binary where `sudo`
+finds it (`sudo` does not search `~/.cargo/bin` on most distributions):
 
 ```sh
-cargo install --path .        # or: cargo build --release && cp target/release/warren /usr/local/bin/
+cargo build --release && sudo install -m 755 target/release/warren /usr/local/bin/warren
 ```
+
+On your machines either do the same or run `cargo install --path .`.
 
 ### 3. Run the relay (on the server)
 
@@ -124,7 +128,7 @@ warren unpublish web
 | `warren join CODE --relay URL [--name N]` | enroll this machine (generates its keys) |
 | `warren up` | run the node daemon in the foreground |
 | `warren install` / `uninstall` | start `warren up` at login (launchd on macOS, systemd user unit on Linux) |
-| `warren down` | stop the running daemon |
+| `warren down` | stop the running daemon (a daemon started by `warren install` then stays stopped until the next login or `warren install`) |
 | `warren status` | relay, connection state, latency, shares, forwards, publishes, recent errors |
 | `warren share PORT [--to a,b]` / `unshare PORT` | allow (some) enrolled machines to reach `127.0.0.1:PORT` |
 | `warren forward LOCAL NODE:PORT` / `--remove LOCAL` | listen on `127.0.0.1:LOCAL` and forward to a peer |
@@ -133,10 +137,12 @@ warren unpublish web
 | `warren publish PORT --name N [--replace] [--allow CIDR,...]` | publish a local port at `https://N.<domain>/` |
 | `warren unpublish N` | release a published name |
 | `warren devices` | machines, fingerprints, online state, last seen, pin state |
-| `warren trust NAME [--expect FINGERPRINT]` | accept a peer's new key after a legitimate change |
+| `warren trust NAME [--expect FINGERPRINT]` | accept a peer's new key after a legitimate change (replacing a pinned key requires `--expect`) |
 
-Every command accepts `--json` for machine-readable output. Shares, forwards
-and publishes persist across restarts.
+Every command accepts `--json` for machine-readable output; failures,
+including argument errors, are then a JSON object `{"ok": false, "code":
+..., "error": ...}` on stdout. Shares, forwards and publishes persist across
+restarts.
 
 Nodes run on macOS and Linux. On Linux, systemd user services run only while
 you are logged in; on a headless machine run `loginctl enable-linger $USER`
@@ -148,14 +154,14 @@ once so `warren up` starts at boot.
 |---:|---|
 | 0 | success |
 | 1 | other error |
-| 2 | usage error |
+| 2 | usage error (bad arguments, e.g. an invalid `--name` or a non-`https` `--relay` for `join`) |
 | 3 | this machine is not enrolled |
 | 4 | the daemon is not running |
 | 5 | not connected to the relay (or the relay is unreachable during `join`) |
 | 6 | refused: port not shared, not shared with you, node offline or unknown, nothing listening, limits |
-| 7 | a pinned key changed, or `trust --expect` did not match |
+| 7 | a pinned key changed, `trust` needs `--expect` to replace a pinned key, or `--expect` did not match |
 | 8 | authentication or enrollment refused (bad or used code, rate limited, revoked) |
-| 9 | name conflict (`publish` of a name held by another node, or already published without `--replace`) |
+| 9 | name conflict (`publish` of a name held by another node, or already published without `--replace`; `join --name` of a name in use) |
 
 ### Files and environment
 
@@ -169,11 +175,18 @@ directory is `0700` and every file in it `0600`:
 | `known_peers.json` | pinned peer keys |
 | `forwards.json`, `publishes.json` | persisted forwards and publishes |
 | `warren.sock` | control socket used by the CLI |
-| `logs/warren.log` | daemon log when started by `warren install` |
+| `logs/warren.log` | daemon log when started by `warren install` on macOS |
 
-`WARREN_LOG` sets the log filter (`info`, `debug`, ...). `WARREN_LAUNCHD_DIR`
-and `WARREN_SYSTEMD_DIR` (or `warren install --dir`) write the login service
-file elsewhere without loading it.
+On Linux the login service logs to the user journal: `journalctl --user -u
+warren` (with a custom `WARREN_HOME` the unit name has a suffix;
+`warren install --json` prints it as `label`).
+
+`WARREN_LOG` sets how much warren itself logs: a level (`info`, `debug`,
+`trace`) or directives for its modules (`warren::relay=debug`). Libraries log
+at `warn` at most whatever it says, so no setting puts protocol messages
+(enrollment codes, published traffic) in the log. `WARREN_LAUNCHD_DIR` and
+`WARREN_SYSTEMD_DIR` (or `warren install --dir`) write the login service file
+elsewhere without loading it.
 
 ## Security model
 
@@ -189,25 +202,36 @@ them.
   and a truncated stream is detected (the end of a stream is itself an
   authenticated message);
 * reach a port the destination has not shared, or reach it as a machine the
-  share is not for: the destination checks its own `shares.json`, and the
-  Noise handshake proves which key the other end holds;
+  share is not for: the destination checks its own `shares.json`, the Noise
+  handshake proves which key the other end holds, and the destination
+  connects to the local service only after the opener has completed a fresh
+  handshake, so replaying a recorded one gets the relay nowhere;
 * impersonate a machine whose key you have pinned.
+
+Text that comes from other machines or from the relay (refusal messages,
+names) is shown with control characters escaped, so it cannot rewrite your
+terminal.
 
 **Trust on first use.** The first time a machine talks to a peer, it takes the
 peer's static key from the relay's registry and pins it. A relay that is
 malicious at that very first contact could substitute a key. Compare
 fingerprints with `warren devices` on both machines (or `warren trust NAME
---expect FINGERPRINT`) when you enroll a machine; after that, a changed key
-is refused with an error until you run `warren trust NAME`, which shows the old
-and new fingerprints.
+--expect FINGERPRINT`) when you enroll a machine. After that, a changed key
+is refused with an error showing the pinned and the new fingerprint. Check
+the new one on that machine itself (`warren status` shows its own), then
+accept it with `warren trust NAME --expect FINGERPRINT`; `trust` without
+`--expect` never replaces a pinned key, so the relay cannot slip in another
+key between showing you one and the moment you accept it. A pin store that
+cannot be read is an error, never a reason to trust anew.
 
 **Authentication.** Each node proves possession of its Ed25519 key on every
 connection by signing a fresh random challenge bound to the relay's host name,
 so signatures cannot be replayed or relayed to another relay. Unknown and
-revoked keys are refused. Enrollment codes are 10 characters from an alphabet
-without look-alike characters, valid for 10 minutes, single use, limited to 5
-failed attempts per IP address per 10 minutes, and stored only as SHA-256
-hashes.
+revoked keys are refused; revoking a machine disconnects it immediately,
+including a connection it is making at that moment. Enrollment codes are 10
+characters from an alphabet without look-alike characters, valid for 10
+minutes, single use, limited to 5 failed attempts per IP address per 10
+minutes, and stored only as SHA-256 hashes.
 
 **Local files.** Keys never leave the machine; files are `0600` in a `0700`
 directory; keys and codes never appear in logs or `--json` output.
@@ -224,7 +248,7 @@ hostile can stop your links, but cannot read or redirect them.
 | limit | value |
 |---|---|
 | concurrent streams per machine | 1024 |
-| stream opens per machine | 64 per second (burst 64) |
+| stream opens per machine | 64 per second (burst 64); the daemon paces itself just below this, so a burst of local connections is delayed, not refused |
 | frame payload | 65535 bytes (one frame per WebSocket message) |
 | flow-control window | 256 KiB per stream, per direction |
 | public request head | 32 KiB (larger: `431`) |
@@ -232,7 +256,8 @@ hostile can stop your links, but cannot read or redirect them.
 | public connection idle (no bytes either way) | 5 min |
 | relay connections (any kind) | 16384 total, 256 per client IP |
 | enrollment failures | 5 per IP per 10 minutes |
-| relay-side outbound queue per machine | 64 MiB (a machine that stops reading is disconnected) |
+| relay-side stream data queued per machine | 32 MiB; when full, the relay stops reading from the machines sending to it until there is room, and a machine whose queue makes no progress for 20 s is disconnected |
+| other frames queued per machine | 64 MiB (a machine that stops reading while provoking replies is disconnected) |
 
 Violations are handled locally: an overrunning stream is reset, a malformed or
 oversized frame closes that machine's connection, excess opens are refused with

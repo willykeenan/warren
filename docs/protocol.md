@@ -19,6 +19,11 @@ A binary message larger than `7 + 65535` bytes, a text message after the
 handshake, or a frame whose length field does not match the message size
 closes the connection.
 
+Each side may send PING, PONG, WINDOW and CTRL frames ahead of stream frames
+it queued earlier, so keepalives and credit are never stuck behind data. The
+OPEN, OPEN_OK, OPEN_ERR, DATA and CLOSE frames of a stream always keep their
+order.
+
 The node reconnects with jittered exponential backoff: a random delay between
 half and all of `min(1 s * 2^attempt, 60 s)`; the attempt counter resets after
 a connection that lasted more than 30 s.
@@ -49,8 +54,8 @@ where `relay_host` is the lower-case host part of the relay URL the node was
 configured with (no port). The relay verifies it with the key it registered
 for `node_id` and against its own configured domain, so a signature is useless
 on another connection (fresh challenge) and on another relay (different host).
-Unknown keys get `unknown_node`, revoked ones `revoked`, bad signatures
-`bad_signature`.
+Unknown keys get `unknown_node`, revoked ones `revoked` (also when the node
+is revoked while it authenticates), bad signatures `bad_signature`.
 
 ### Join (new node)
 
@@ -117,11 +122,24 @@ connection, streams opened by the node use odd ids and streams opened by the
 relay use even ids. A node that opens an even id, reuses a live id or sends
 stream frames on id 0 is disconnected.
 
-**Flow control.** Each direction of each stream starts with 256 KiB of credit.
-A sender may only send DATA within its credit; the receiver returns credit
-with WINDOW after consuming data (in practice every 64 KiB). Receiving more
-than the window resets the stream with `window_overrun`. Credit above 64 MiB
-is a protocol error.
+**Flow control.** Each direction of each stream has 256 KiB of initial credit:
+the side that answers an OPEN may send once it has sent OPEN_OK, the opener
+once it has received OPEN_OK. A sender may only send DATA within its credit;
+the receiver returns credit with WINDOW after consuming data (in practice
+every 64 KiB). Receiving more than the window resets the stream with
+`window_overrun`; the relay resets a stream whose opener sends DATA before
+the destination accepted it with `protocol`, so nothing is queued toward a
+node for a stream its policy has not admitted. Credit above 64 MiB is a
+protocol error.
+
+**Backpressure.** Per-stream credit bounds each stream; each connection's
+queue of stream data is bounded as well. A node queues up to every stream's
+full window (1024 x 256 KiB plus headers) before its senders wait. The relay
+queues at most 32 MiB of stream data toward each node; when that is full it
+stops reading from the node whose DATA it is forwarding until there is room
+(so TCP slows that node down), and a node whose queue makes no progress for
+20 s is disconnected. Other frames are not flow-controlled: more than 64 MiB
+of them queued toward a peer that is not reading closes the connection.
 
 **Closing.** CLOSE with an empty payload means "no more data from me". A
 stream is finished when both sides have sent FIN, or when either side sends
@@ -156,7 +174,7 @@ flags u8 | port u16 | dest (len u8, bytes) | src (len u8, bytes)
 | 3 | `not_shared` | the destination does not share that port |
 | 4 | `forbidden` | the port is shared, but not with the opener |
 | 5 | `too_many_streams` | 1024 concurrent streams reached (either end) |
-| 6 | `rate_limited` | more than 64 opens per second |
+| 6 | `rate_limited` | more than 64 opens per second (nodes pace themselves at 60 per second and retry) |
 | 7 | `connect_failed` | nothing is listening on the destination port |
 | 8 | `key_changed` | the destination has a different key pinned for the opener |
 | 9 | `no_such_publish` | the node does not publish that name |
@@ -190,14 +208,24 @@ flags u8 | port u16 | dest (len u8, bytes) | src (len u8, bytes)
 5. After message 1, B checks that the key the handshake proved equals
    `src_static`, and that `src`, `dest` and `port` in the encrypted payload
    match the OPEN; otherwise it resets the stream (`handshake_failed` or
-   `forbidden`). On first contact B pins A's key. B connects to
-   `127.0.0.1:port` (reset with `connect_failed` if that fails) and sends
-   message 2.
-6. Every later DATA frame is exactly one Noise transport message (at most
+   `forbidden`). B then sends message 2.
+6. **Confirmation.** A's first transport message is the fixed plaintext
+   `warren-v1-confirm`. Message 1 contains nothing chosen by B, so B cannot
+   tell a fresh message 1 from one the relay recorded earlier; only the real
+   A can encrypt to B's fresh ephemeral key. B waits for the confirmation
+   (at most 15 s) and does nothing before it: no pinning, no connection to
+   the local service.
+7. **Status.** On first contact B now pins A's key. B connects to
+   `127.0.0.1:port` and sends its first transport message, a status:
+   `{"ok":true}`, or `{"ok":false,"code":"connect_failed"}` followed by a
+   reset with `aborted`. The status is encrypted, so the relay does not learn
+   whether anything listens on the port.
+8. Every later DATA frame is exactly one Noise transport message (at most
    65535 bytes, so at most 65519 bytes of plaintext), with nonces counting up
-   from 0 in each direction. An **empty** transport message is the
-   authenticated end of stream; the sender then sends FIN. A FIN without that
-   marker is treated as truncation and the local connection is aborted.
+   in each direction (the confirmation and the status are number 0). An
+   **empty** transport message is the authenticated end of stream; the sender
+   then sends FIN. A FIN without that marker is treated as truncation and the
+   local connection is aborted.
 
 The relay never holds a key for these streams. It forwards DATA, WINDOW and
 CLOSE between the two ids unchanged apart from the stream id, and tracks credit
@@ -205,7 +233,8 @@ for each direction so that a node cannot make it buffer more than the window.
 
 If A's handshake fails, A asks the relay for B's current key; if it differs
 from the pinned one the user gets a `key_changed` error naming both
-fingerprints and `warren trust b`.
+fingerprints and the command `warren trust b --expect <new fingerprint>`, to
+run once the new fingerprint has been checked on B itself.
 
 Fingerprints are the first 16 bytes of `SHA-256(static_pub)` in hex, in groups
 of four characters separated by colons.
@@ -240,10 +269,11 @@ The relay's HTTP handling for these streams:
 
 ## 6. Control messages
 
-CTRL frames on stream 0 carry JSON. Requests from a node:
+CTRL frames on stream 0 carry JSON (at most one frame: 65535 bytes). Requests
+from a node:
 
 ```json
-{"id":1,"op":"devices"}
+{"id":1,"op":"devices","offset":0}
 {"id":2,"op":"lookup","name":"b"}
 {"id":3,"op":"publish","name":"web","replace":false,"reclaim":false,"allow":["10.0.0.0/8"]}
 {"id":4,"op":"unpublish","name":"web"}
@@ -253,15 +283,24 @@ CTRL frames on stream 0 carry JSON. Requests from a node:
 Responses echo the id:
 
 ```json
+{"id":1,"ok":true,"result":{"devices":[{"node_id":"...","name":"b", ...}],"next":128,"total":301}}
 {"id":2,"ok":true,"result":{"node_id":"...","name":"b","static_pub":"<hex>","sign_pub":"<hex>","online":true,"last_seen":1790000000,"created_at":1789990000}}
 {"id":3,"ok":false,"code":"name_taken","error":"\"web\" is published by another node"}
 ```
 
+`devices` is paged so every reply fits in one frame: entries sorted by name,
+starting at `offset` (at most 128, fewer if they would not fit); `next` is the
+offset of the following page, absent on the last one. A reply that would not
+fit in a frame is replaced by the error `too_large`.
+
 Publish error codes: `bad_name`, `bad_cidr`, `name_taken` (held by another
 node, regardless of `replace`), `already_published` (held by this node and
-`replace` not set). `reclaim` is sent by the daemon after reconnecting to
-re-announce its own publishes. Events pushed by the relay have no id, e.g.
-`{"event":"revoked"}`. Control requests are rate limited (20 per second).
+`replace` not set), `revoked` (a revoked node never holds names). `reclaim`
+is sent by the daemon after reconnecting to re-announce its own publishes.
+Events pushed by the relay have no id, e.g. `{"event":"revoked"}`. Control
+requests are rate limited (20 per second, burst 40); a request refused with
+`rate_limited` was not carried out, and nodes retry it. A connection whose
+node has been revoked is closed on its next OPEN or CTRL frame.
 
 ## 7. Relay state
 

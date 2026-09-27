@@ -170,9 +170,15 @@ impl Frame {
         Frame::new(FrameType::OpenErr, stream, b.freeze())
     }
 
-    pub fn ctrl(value: &impl Serialize) -> Frame {
-        let v = serde_json::to_vec(value).unwrap_or_default();
-        Frame::new(FrameType::Ctrl, CONTROL_STREAM, Bytes::from(v))
+    /// A CTRL frame carrying `value` as JSON. Fails (instead of producing a
+    /// frame whose length field cannot describe it) when the JSON does not
+    /// fit in one frame.
+    pub fn ctrl(value: &impl Serialize) -> Result<Frame, ProtoError> {
+        let v = serde_json::to_vec(value).map_err(|_| ProtoError::Malformed("CTRL"))?;
+        if !ctrl_payload_ok(&v) {
+            return Err(ProtoError::TooLarge);
+        }
+        Ok(Frame::new(FrameType::Ctrl, CONTROL_STREAM, Bytes::from(v)))
     }
 
     /// Parse a WINDOW payload.
@@ -193,12 +199,13 @@ impl Frame {
         self.payload.first().map(|c| ErrorCode::from_u8(*c))
     }
 
-    /// Parse an OPEN_ERR payload.
+    /// Parse an OPEN_ERR payload. The message comes from another machine, so
+    /// it is returned made safe for display ([`crate::sanitize_remote_text`]).
     pub fn open_error(&self) -> (ErrorCode, String) {
         match self.payload.split_first() {
             Some((c, rest)) => (
                 ErrorCode::from_u8(*c),
-                String::from_utf8_lossy(rest).into_owned(),
+                crate::sanitize_remote_text(&String::from_utf8_lossy(rest)),
             ),
             None => (ErrorCode::Internal, String::new()),
         }
@@ -472,6 +479,18 @@ impl DeviceInfo {
     }
 }
 
+/// Result of the `devices` control request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DevicesPage {
+    pub devices: Vec<DeviceInfo>,
+    /// Offset of the next page, if there is one.
+    #[serde(default)]
+    pub next: Option<usize>,
+    /// Number of registered nodes.
+    #[serde(default)]
+    pub total: usize,
+}
+
 /// Control request (node to relay), carried in CTRL frames.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtrlRequest {
@@ -483,7 +502,14 @@ pub struct CtrlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CtrlOp {
-    Devices,
+    /// One page of the registry, sorted by name, starting at `offset`. The
+    /// relay returns a [`DevicesPage`] that always fits in one frame.
+    Devices {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     Lookup {
         name: String,
     },
@@ -591,6 +617,8 @@ mod tests {
             e.open_error(),
             (ErrorCode::NotShared, "port 22 is not shared".to_string())
         );
+        let hostile = Frame::open_err(5, ErrorCode::NotShared, "\u{1b}]0;x\u{7}\u{1b}[2J");
+        assert!(!hostile.open_error().1.chars().any(|c| c.is_control()));
         for c in 1..=16u8 {
             let code = ErrorCode::from_u8(c);
             if c != 11 {
@@ -648,6 +676,23 @@ mod tests {
         assert!(s.contains("\"op\":\"publish\""));
         let back: CtrlRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, 4);
+        // `devices` without paging fields still parses (first page).
+        let d: CtrlRequest = serde_json::from_str(r#"{"id":1,"op":"devices"}"#).unwrap();
+        assert!(matches!(
+            d.op,
+            CtrlOp::Devices {
+                offset: 0,
+                limit: None
+            }
+        ));
+        // A CTRL message that cannot fit in one frame is refused, not truncated.
+        let big = "x".repeat(MAX_CTRL_PAYLOAD);
+        assert_eq!(Frame::ctrl(&big).unwrap_err(), ProtoError::TooLarge);
+        let ok = Frame::ctrl(&"x".repeat(MAX_CTRL_PAYLOAD - 2)).unwrap();
+        assert_eq!(
+            Frame::decode(ok.encode()).unwrap().payload.len(),
+            MAX_CTRL_PAYLOAD
+        );
         let hello = NodeHello::Join {
             version: 1,
             code: "SECRETCODE".into(),

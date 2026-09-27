@@ -2,15 +2,16 @@
 //! control and the endpoint-side stream handles used by nodes and by the relay
 //! for public traffic.
 
-use crate::limits::MAX_LINK_QUEUE;
-use crate::proto::{ErrorCode, Frame, FrameType, MAX_PAYLOAD, STREAM_WINDOW};
+use crate::limits::{MAX_LINK_QUEUE, NODE_LINK_DATA_BUDGET};
+use crate::proto::{ErrorCode, Frame, FrameType, MAX_PAYLOAD, MAX_WS_MESSAGE, STREAM_WINDOW};
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -33,43 +34,197 @@ pub enum TapDir {
 /// what the relay sees).
 pub type Tap = Arc<dyn Fn(TapDir, &[u8]) + Send + Sync>;
 
-/// Outbound frame queue of one link. Unbounded in slots but capped in bytes:
-/// a link that stops reading is closed instead of consuming unbounded memory.
+/// One queued, encoded frame.
+struct Queued {
+    bytes: Bytes,
+    /// Counted against the DATA budget (else against the control cap).
+    data: bool,
+}
+
+/// Byte accounting shared by a link's queue and its writer.
+struct Accounting {
+    /// Bytes of frames that are not flow-controlled, capped at [`MAX_LINK_QUEUE`].
+    ctrl: AtomicUsize,
+    /// Bytes of DATA frames queued.
+    data: AtomicUsize,
+    /// Room for DATA bytes; senders wait for permits.
+    budget: Semaphore,
+    /// When the writer last moved a frame toward the socket (ms since `base`).
+    progress_ms: AtomicU64,
+    base: Instant,
+}
+
+impl Accounting {
+    fn note_progress(&self) {
+        let ms = self.base.elapsed().as_millis() as u64;
+        self.progress_ms.fetch_max(ms, Ordering::AcqRel);
+    }
+}
+
+/// Outbound frame queue of one link.
+///
+/// Two lanes feed the writer: connection-level frames that may overtake data
+/// (PING, PONG, WINDOW, CTRL) and everything else in order (OPEN, OPEN_OK,
+/// OPEN_ERR, DATA, CLOSE), so keepalives and credit updates are not stuck
+/// behind a long data queue while a stream's DATA never overtakes its OPEN or
+/// is overtaken by its FIN.
+///
+/// DATA is flow-controlled per stream and additionally bounded per link by a
+/// byte budget: [`LinkOut::send_data`] waits for room instead of failing, so
+/// legal traffic never tears the link down. Everything else goes through the
+/// non-blocking [`LinkOut::send`], capped at [`MAX_LINK_QUEUE`] bytes: a peer
+/// that stops reading while provoking replies is disconnected.
 #[derive(Clone)]
 pub struct LinkOut {
-    tx: mpsc::UnboundedSender<Bytes>,
-    queued: Arc<AtomicUsize>,
+    prio: mpsc::UnboundedSender<Queued>,
+    ordered: mpsc::UnboundedSender<Queued>,
+    acct: Arc<Accounting>,
     closed: CancellationToken,
 }
 
+/// Receiving end of a [`LinkOut`], drained by [`run_writer`].
+pub struct LinkRx {
+    prio: mpsc::UnboundedReceiver<Queued>,
+    ordered: mpsc::UnboundedReceiver<Queued>,
+    acct: Arc<Accounting>,
+}
+
+impl LinkRx {
+    fn release(&self, q: Queued) -> Bytes {
+        let n = q.bytes.len();
+        if q.data {
+            self.acct.data.fetch_sub(n, Ordering::AcqRel);
+            self.acct.budget.add_permits(n);
+        } else {
+            self.acct.ctrl.fetch_sub(n, Ordering::AcqRel);
+        }
+        q.bytes
+    }
+
+    /// Next encoded frame to write (connection-level frames first); `None`
+    /// once every [`LinkOut`] clone is gone.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        let q = tokio::select! {
+            biased;
+            Some(q) = self.prio.recv() => q,
+            Some(q) = self.ordered.recv() => q,
+            else => return None,
+        };
+        Some(self.release(q))
+    }
+
+    /// Next encoded frame if one is queued.
+    pub fn try_recv(&mut self) -> Option<Bytes> {
+        let q = match self.prio.try_recv() {
+            Ok(q) => q,
+            Err(_) => self.ordered.try_recv().ok()?,
+        };
+        Some(self.release(q))
+    }
+}
+
+fn is_priority(ty: FrameType) -> bool {
+    matches!(
+        ty,
+        FrameType::Ping | FrameType::Pong | FrameType::Window | FrameType::Ctrl
+    )
+}
+
 impl LinkOut {
-    pub fn new(closed: CancellationToken) -> (LinkOut, mpsc::UnboundedReceiver<Bytes>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// A queue with the node-side DATA budget ([`NODE_LINK_DATA_BUDGET`]).
+    pub fn new(closed: CancellationToken) -> (LinkOut, LinkRx) {
+        LinkOut::with_data_budget(closed, NODE_LINK_DATA_BUDGET)
+    }
+
+    /// A queue whose DATA senders wait once `budget` bytes are queued.
+    pub fn with_data_budget(closed: CancellationToken, budget: usize) -> (LinkOut, LinkRx) {
+        let (ptx, prx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let acct = Arc::new(Accounting {
+            ctrl: AtomicUsize::new(0),
+            data: AtomicUsize::new(0),
+            // At least one maximal frame must always fit.
+            budget: Semaphore::new(budget.max(MAX_WS_MESSAGE)),
+            progress_ms: AtomicU64::new(0),
+            base: Instant::now(),
+        });
         (
             LinkOut {
-                tx,
-                queued: Arc::new(AtomicUsize::new(0)),
+                prio: ptx,
+                ordered: otx,
+                acct: acct.clone(),
                 closed,
             },
-            rx,
+            LinkRx {
+                prio: prx,
+                ordered: orx,
+                acct,
+            },
         )
     }
 
-    /// Queue a frame. Returns false if the link is closed (or was just closed
-    /// for exceeding its queue cap).
+    /// Queue a frame without waiting. Returns false if the link is closed (or
+    /// was just closed because the peer stopped reading: more than
+    /// [`MAX_LINK_QUEUE`] bytes of such frames are queued).
     pub fn send(&self, f: Frame) -> bool {
+        if self.closed.is_cancelled() {
+            return false;
+        }
+        let prio = is_priority(f.ty);
+        let b = f.encode();
+        let n = b.len();
+        let q = self.acct.ctrl.fetch_add(n, Ordering::AcqRel) + n;
+        if q > MAX_LINK_QUEUE {
+            tracing::warn!("link outbound queue exceeded {MAX_LINK_QUEUE} bytes; closing link");
+            self.acct.ctrl.fetch_sub(n, Ordering::AcqRel);
+            self.closed.cancel();
+            return false;
+        }
+        let lane = if prio { &self.prio } else { &self.ordered };
+        if lane
+            .send(Queued {
+                bytes: b,
+                data: false,
+            })
+            .is_err()
+        {
+            self.acct.ctrl.fetch_sub(n, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Queue a DATA frame, waiting while the link's DATA budget is used up.
+    /// Returns false if the link is (or gets) closed.
+    pub async fn send_data(&self, f: Frame) -> bool {
         if self.closed.is_cancelled() {
             return false;
         }
         let b = f.encode();
         let n = b.len();
-        let q = self.queued.fetch_add(n, Ordering::AcqRel) + n;
-        if q > MAX_LINK_QUEUE {
-            tracing::warn!("link outbound queue exceeded {MAX_LINK_QUEUE} bytes; closing link");
-            self.closed.cancel();
+        let permit = tokio::select! {
+            p = self.acct.budget.acquire_many(n as u32) => match p {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
+            _ = self.closed.cancelled() => return false,
+        };
+        permit.forget();
+        self.acct.data.fetch_add(n, Ordering::AcqRel);
+        if self.closed.is_cancelled()
+            || self
+                .ordered
+                .send(Queued {
+                    bytes: b,
+                    data: true,
+                })
+                .is_err()
+        {
+            self.acct.data.fetch_sub(n, Ordering::AcqRel);
+            self.acct.budget.add_permits(n);
             return false;
         }
-        self.tx.send(b).is_ok()
+        true
     }
 
     pub fn is_closed(&self) -> bool {
@@ -84,22 +239,28 @@ impl LinkOut {
         &self.closed
     }
 
+    /// Bytes currently queued (DATA and everything else).
     pub fn queued_bytes(&self) -> usize {
-        self.queued.load(Ordering::Acquire)
+        self.acct.ctrl.load(Ordering::Acquire) + self.acct.data.load(Ordering::Acquire)
     }
 
-    fn written(&self, n: usize) {
-        self.queued.fetch_sub(n, Ordering::AcqRel);
+    /// DATA bytes currently queued.
+    pub fn queued_data(&self) -> usize {
+        self.acct.data.load(Ordering::Acquire)
+    }
+
+    /// How long this link's writer has made no progress, counting from
+    /// `since` at the earliest (the moment a sender started waiting).
+    pub fn stalled_for(&self, since: Instant) -> std::time::Duration {
+        let last = self.acct.base
+            + std::time::Duration::from_millis(self.acct.progress_ms.load(Ordering::Acquire));
+        Instant::now().saturating_duration_since(last.max(since))
     }
 }
 
 /// Drain a link's outbound queue into the WebSocket sink, batching writes.
-pub async fn run_writer<S>(
-    mut sink: S,
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
-    out: LinkOut,
-    tap: Option<Tap>,
-) where
+pub async fn run_writer<S>(mut sink: S, mut rx: LinkRx, out: LinkOut, tap: Option<Tap>)
+where
     S: Sink<Message, Error = WsError> + Unpin,
 {
     loop {
@@ -111,27 +272,26 @@ pub async fn run_writer<S>(
         let mut batch = vec![first];
         while batch.len() < 64 {
             match rx.try_recv() {
-                Ok(b) => batch.push(b),
-                Err(_) => break,
+                Some(b) => batch.push(b),
+                None => break,
             }
         }
         let mut failed = false;
         for b in batch {
-            let n = b.len();
             if let Some(t) = &tap {
                 t(TapDir::Out, &b);
             }
-            let r = sink.feed(Message::Binary(b)).await;
-            out.written(n);
-            if r.is_err() {
+            if sink.feed(Message::Binary(b)).await.is_err() {
                 failed = true;
                 break;
             }
+            out.acct.note_progress();
         }
         if failed || sink.flush().await.is_err() {
             out.close();
             break;
         }
+        out.acct.note_progress();
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sink.close()).await;
 }
@@ -368,7 +528,12 @@ impl MuxSender {
         if self.shared.reset.load(Ordering::SeqCst) {
             return Err(broken("stream reset"));
         }
-        if !self.host.out().send(Frame::data(self.shared.id, data)) {
+        if !self
+            .host
+            .out()
+            .send_data(Frame::data(self.shared.id, data))
+            .await
+        {
             return Err(broken("link closed"));
         }
         Ok(())
@@ -578,7 +743,7 @@ mod tests {
         }
     }
 
-    fn host() -> (Arc<TestHost>, mpsc::UnboundedReceiver<Bytes>) {
+    fn host() -> (Arc<TestHost>, LinkRx) {
         let (out, rx) = LinkOut::new(CancellationToken::new());
         (
             Arc::new(TestHost {
@@ -653,7 +818,7 @@ mod tests {
         assert!(b.table.lock().unwrap().is_empty());
         // Reset frame was sent back.
         let mut saw_reset = false;
-        while let Ok(m) = b_wire.try_recv() {
+        while let Some(m) = b_wire.try_recv() {
             let f = Frame::decode(m).unwrap();
             if f.ty == FrameType::Close && f.close_kind() == Some(ErrorCode::WindowOverrun) {
                 saw_reset = true;
@@ -697,6 +862,73 @@ mod tests {
         }
         assert!(out.is_closed());
         assert!(sent * MAX_PAYLOAD <= MAX_LINK_QUEUE);
+    }
+
+    #[tokio::test]
+    async fn data_budget_waits_instead_of_closing() {
+        let (out, mut rx) = LinkOut::with_data_budget(CancellationToken::new(), 3 * MAX_WS_MESSAGE);
+        let big = Bytes::from(vec![0u8; MAX_PAYLOAD]);
+        for _ in 0..3 {
+            assert!(out.send_data(Frame::data(1, big.clone())).await);
+        }
+        // The budget is used up: the next DATA waits, and the link stays open.
+        let o2 = out.clone();
+        let b2 = big.clone();
+        let waiting = tokio::spawn(async move { o2.send_data(Frame::data(1, b2)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        assert!(!out.is_closed());
+        // Control frames still get through (and are not stuck behind DATA).
+        assert!(out.send(Frame::new(FrameType::Ping, 0, Bytes::from_static(b"p"))));
+        let first = Frame::decode(rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first.ty, FrameType::Ping);
+        // Draining makes room for the waiting sender.
+        rx.recv().await.unwrap();
+        assert!(waiting.await.unwrap());
+        assert_eq!(out.queued_data(), 3 * MAX_WS_MESSAGE);
+        // Closing wakes waiters with a failure.
+        let o3 = out.clone();
+        let blocked = tokio::spawn(async move { o3.send_data(Frame::data(1, big)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        out.close();
+        assert!(!blocked.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stall_is_measured_from_the_last_progress() {
+        let (out, rx) = LinkOut::new(CancellationToken::new());
+        let t0 = Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // A sender that just started waiting is not stalled, however long the
+        // link was idle before.
+        assert!(out.stalled_for(Instant::now()) < std::time::Duration::from_millis(5));
+        assert!(out.stalled_for(t0) >= std::time::Duration::from_millis(30));
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn fin_never_overtakes_data() {
+        let (out, mut rx) = LinkOut::new(CancellationToken::new());
+        assert!(out.send(Frame::new(FrameType::Open, 1, Bytes::new())));
+        assert!(
+            out.send_data(Frame::data(1, Bytes::from_static(b"x")))
+                .await
+        );
+        assert!(out.send(Frame::fin(1)));
+        assert!(out.send(Frame::window(3, 10)));
+        let order: Vec<FrameType> = std::iter::from_fn(|| rx.try_recv())
+            .map(|b| Frame::decode(b).unwrap().ty)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                FrameType::Window,
+                FrameType::Open,
+                FrameType::Data,
+                FrameType::Close
+            ]
+        );
+        assert_eq!(out.queued_bytes(), 0);
     }
 
     #[tokio::test]

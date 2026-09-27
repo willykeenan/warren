@@ -9,8 +9,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
-/// Maximum size of one control line.
+/// Maximum size of one request line (what the daemon accepts from a client).
 pub const MAX_LINE: u64 = 64 * 1024;
+/// Maximum size of one response line (what the CLI accepts from the daemon;
+/// `devices` on a large relay is the biggest).
+pub const MAX_RESPONSE_LINE: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -104,13 +107,21 @@ async fn connect(paths: &NodePaths) -> Result<UnixStream, ControlError> {
     }
 }
 
-/// Read one JSON line.
+/// Read one JSON request line (at most [`MAX_LINE`] bytes).
 pub async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
 ) -> io::Result<Option<String>> {
+    read_line_limited(r, MAX_LINE).await
+}
+
+/// Read one JSON line of at most `max` bytes.
+pub async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: u64,
+) -> io::Result<Option<String>> {
     use tokio::io::AsyncReadExt;
     let mut line = String::new();
-    let n = (&mut *r).take(MAX_LINE).read_line(&mut line).await?;
+    let n = (&mut *r).take(max).read_line(&mut line).await?;
     if n == 0 {
         return Ok(None);
     }
@@ -134,8 +145,15 @@ pub async fn request(
     line.push(b'\n');
     w.write_all(&line).await?;
     let mut r = BufReader::new(r);
-    let resp = read_line(&mut r).await?.ok_or(ControlError::Protocol)?;
+    let resp = read_line_limited(&mut r, MAX_RESPONSE_LINE)
+        .await?
+        .ok_or(ControlError::Protocol)?;
     serde_json::from_str(&resp).map_err(|_| ControlError::Protocol)
+}
+
+/// True if a daemon answers on this home's control socket.
+pub async fn daemon_running(paths: &NodePaths) -> bool {
+    paths.socket().exists() && UnixStream::connect(paths.socket()).await.is_ok()
 }
 
 /// Ask the daemon to open a private stream; on success returns the pipe.
@@ -154,7 +172,9 @@ pub async fn open(
     line.push(b'\n');
     w.write_all(&line).await?;
     let mut r = BufReader::new(r);
-    let resp = read_line(&mut r).await?.ok_or(ControlError::Protocol)?;
+    let resp = read_line_limited(&mut r, MAX_RESPONSE_LINE)
+        .await?
+        .ok_or(ControlError::Protocol)?;
     let resp: ControlResponse = serde_json::from_str(&resp).map_err(|_| ControlError::Protocol)?;
     if resp.ok {
         Ok(Ok((r, w)))

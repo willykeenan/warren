@@ -8,6 +8,7 @@ use super::{
     ShareDecision, SharesFile,
 };
 use crate::crypto::{self, Identity};
+use crate::limits::{TokenBucket, NODE_OPENS_PER_SEC, NODE_OPEN_BURST};
 use crate::mux::{self, LinkOut, MuxReceiver, MuxSender, Slot, StreamHost};
 use crate::net::{self, RelayUrl};
 use crate::noise::{self, Hello, SecureChannel};
@@ -72,7 +73,7 @@ pub enum OpenError {
         node: String,
         message: String,
     },
-    #[error("the key of {name} changed (pinned {pinned}, relay now reports {current}); if this is expected run `warren trust {name}`")]
+    #[error("the key of {name} changed (pinned {pinned}, relay now reports {current}); if this is expected, check the fingerprint on {name} itself (`warren status` there) and run `warren trust {name} --expect {current}`")]
     KeyChanged {
         name: String,
         pinned: String,
@@ -106,6 +107,20 @@ pub struct CtrlFailure {
     pub message: String,
 }
 
+impl CtrlFailure {
+    fn new(code: &str, message: &str) -> CtrlFailure {
+        CtrlFailure {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A short random delay before retrying a rate-limited request.
+fn retry_jitter(min_ms: u64, max_ms: u64) -> Duration {
+    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
+}
+
 /// One live relay connection.
 pub struct Session {
     out: LinkOut,
@@ -115,6 +130,8 @@ pub struct Session {
     pending: Mutex<HashMap<u64, oneshot::Sender<CtrlResponse>>>,
     pings: Mutex<HashMap<u64, Instant>>,
     last_pong: Mutex<Instant>,
+    /// Paces our own stream opens under the relay's per-node limit.
+    opens: Mutex<TokenBucket>,
     pub publish_domain: String,
     pub connected_at: i64,
 }
@@ -133,34 +150,43 @@ impl Session {
         self.table.lock().unwrap().len()
     }
 
-    /// Send a control request to the relay and wait for its answer.
+    /// Send a control request to the relay and wait for its answer. A
+    /// request the relay refused as rate limited was not carried out, so it
+    /// is retried for up to 10 s (`SESSION_WAIT`).
     pub async fn ctrl(&self, op: CtrlOp) -> Result<Value, CtrlFailure> {
+        let deadline = Instant::now() + SESSION_WAIT;
+        loop {
+            match self.ctrl_once(op.clone()).await {
+                Err(f) if f.code == "rate_limited" && Instant::now() < deadline => {
+                    tokio::time::sleep(retry_jitter(50, 150)).await;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    async fn ctrl_once(&self, op: CtrlOp) -> Result<Value, CtrlFailure> {
         let id = self.ctrl_id.fetch_add(1, Ordering::Relaxed);
+        let Ok(frame) = Frame::ctrl(&CtrlRequest { id, op }) else {
+            return Err(CtrlFailure::new("too_large", "control request too large"));
+        };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        if !self.out.send(Frame::ctrl(&CtrlRequest { id, op })) {
+        if !self.out.send(frame) {
             self.pending.lock().unwrap().remove(&id);
-            return Err(CtrlFailure {
-                code: "not_connected".into(),
-                message: "relay connection closed".into(),
-            });
+            return Err(CtrlFailure::new("not_connected", "relay connection closed"));
         }
         match tokio::time::timeout(Duration::from_secs(15), rx).await {
             Ok(Ok(r)) if r.ok => Ok(r.result),
+            // The relay's words are shown to the user: make them safe.
             Ok(Ok(r)) => Err(CtrlFailure {
-                code: r.code.unwrap_or_else(|| "error".into()),
-                message: r.error.unwrap_or_default(),
+                code: crate::sanitize_remote_code(r.code.as_deref().unwrap_or("error")),
+                message: crate::sanitize_remote_text(r.error.as_deref().unwrap_or_default()),
             }),
-            Ok(Err(_)) => Err(CtrlFailure {
-                code: "not_connected".into(),
-                message: "relay connection closed".into(),
-            }),
+            Ok(Err(_)) => Err(CtrlFailure::new("not_connected", "relay connection closed")),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(CtrlFailure {
-                    code: "timeout".into(),
-                    message: "relay did not answer".into(),
-                })
+                Err(CtrlFailure::new("timeout", "relay did not answer"))
             }
         }
     }
@@ -177,8 +203,39 @@ impl Session {
         })
     }
 
-    /// Open a stream to `dest:port` through the relay.
+    /// Wait for a token of our own open-rate bucket.
+    async fn pace_open(&self) {
+        loop {
+            let wait = match self.opens.lock().unwrap().take_or_wait() {
+                Ok(()) => return,
+                Err(w) => w,
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Open a stream to `dest:port` through the relay. Opens are paced under
+    /// the relay's per-node rate, and an open the relay still refused as rate
+    /// limited is retried for up to 10 s (`SESSION_WAIT`), so a burst of local
+    /// connections is delayed rather than dropped.
     pub async fn open(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        let deadline = Instant::now() + SESSION_WAIT;
+        loop {
+            self.pace_open().await;
+            match self.open_once(dest, port).await {
+                Err((ErrorCode::RateLimited, _)) if Instant::now() < deadline => {
+                    tokio::time::sleep(retry_jitter(20, 80)).await;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    async fn open_once(
         self: &Arc<Self>,
         dest: &str,
         port: u16,
@@ -255,7 +312,11 @@ pub struct DaemonInner {
     errors: Mutex<VecDeque<ErrorEntry>>,
     forwards: Mutex<BTreeMap<u16, ForwardState>>,
     publishes: Mutex<Vec<Publish>>,
+    /// Serializes changes to `known_peers.json`.
     peers_lock: tokio::sync::Mutex<()>,
+    /// Serializes first-contact key lookups, so a burst of connections to a
+    /// new peer asks the relay once.
+    lookup_lock: tokio::sync::Mutex<()>,
     pub shutdown: CancellationToken,
 }
 
@@ -318,6 +379,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         forwards: Mutex::new(BTreeMap::new()),
         publishes: Mutex::new(publishes),
         peers_lock: tokio::sync::Mutex::new(()),
+        lookup_lock: tokio::sync::Mutex::new(()),
         shutdown: CancellationToken::new(),
     });
 
@@ -462,7 +524,11 @@ impl DaemonInner {
         let publish_domain = match super::read_verdict(&mut ws).await? {
             RelayVerdict::Welcome { publish_domain, .. } => publish_domain,
             RelayVerdict::Error { code, message } => {
-                anyhow::bail!("relay refused authentication ({code}): {message}")
+                anyhow::bail!(
+                    "relay refused authentication ({}): {}",
+                    crate::sanitize_remote_code(&code),
+                    crate::sanitize_remote_text(&message)
+                )
             }
             RelayVerdict::Joined { .. } => anyhow::bail!("unexpected relay reply"),
         };
@@ -475,6 +541,7 @@ impl DaemonInner {
             pending: Mutex::new(HashMap::new()),
             pings: Mutex::new(HashMap::new()),
             last_pong: Mutex::new(Instant::now()),
+            opens: Mutex::new(TokenBucket::new(NODE_OPENS_PER_SEC, NODE_OPEN_BURST)),
             publish_domain,
             connected_at: crate::now_secs(),
         });
@@ -615,6 +682,11 @@ impl DaemonInner {
     /// Destination side of a private stream: policy, pinning, Noise, proxy.
     async fn private_incoming(self: Arc<Self>, p: OpenPayload, tx: MuxSender, rx: MuxReceiver) {
         let paths = &self.cfg.paths;
+        // The source name is the relay's claim; it must at least be a name.
+        if !crate::valid_name(&p.src) {
+            tx.reject(ErrorCode::BadRequest, "invalid source name");
+            return;
+        }
         // 1. Default deny, enforced here regardless of what the relay allowed.
         let shares = match SharesFile::load(paths) {
             Ok(s) => s,
@@ -648,16 +720,24 @@ impl DaemonInner {
             tx.reject(ErrorCode::BadRequest, "missing source key");
             return;
         };
-        let pin_state = KnownPeers::load(paths)
-            .map(|k| k.check(&p.src, &claimed))
-            .unwrap_or(PinCheck::New);
+        let pin_state = match KnownPeers::load(paths) {
+            Ok(k) => k.check(&p.src, &claimed),
+            Err(e) => {
+                // Fail closed: an unreadable pin store pins nothing new.
+                self.record_error(format!("reading pinned keys: {e:#}"));
+                tx.reject(ErrorCode::Internal, "pinned keys unreadable");
+                return;
+            }
+        };
         if let PinCheck::Changed { pinned } = pin_state {
             self.record_error(format!(
-                "refused connection from {}: its key changed (pinned {}, now {}); run `warren trust {}` if expected",
+                "refused connection from {}: its key changed (pinned {}, now {}); if expected, check the fingerprint on {} and run `warren trust {} --expect {}`",
                 p.src,
                 crypto::fingerprint(&pinned),
                 crypto::fingerprint(&claimed),
-                p.src
+                p.src,
+                p.src,
+                crypto::fingerprint(&claimed),
             ));
             tx.reject(
                 ErrorCode::KeyChanged,
@@ -668,7 +748,7 @@ impl DaemonInner {
         if !tx.accept() {
             return;
         }
-        // 3. Noise: proves the initiator holds the claimed static key.
+        // 3. Noise message 1: proves the initiator holds the claimed static key.
         let responder = match noise::respond(tx, rx, &self.id).await {
             Ok(r) => r,
             Err(e) => {
@@ -694,23 +774,33 @@ impl DaemonInner {
             responder.refuse(ErrorCode::Forbidden);
             return;
         }
+        // 4. Message 2 and the initiator's confirmation. Message 1 alone could
+        // be a recording replayed by the relay; nothing below happens until
+        // the initiator proves it is taking part in this handshake.
+        let confirmed = match responder.complete().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.record_error(format!("handshake from {} was not completed: {e}", p.src));
+                return;
+            }
+        };
         if pin_state == PinCheck::New {
             if let Err(e) = self.pin_peer(&p.src, &claimed).await {
                 self.record_error(format!("{e}"));
-                responder.refuse(ErrorCode::KeyChanged);
+                confirmed.refuse(ErrorCode::KeyChanged).await;
                 return;
             }
         }
-        // 4. Connect to the local service and pipe.
+        // 5. Connect to the local service and pipe.
         let tcp = match net::dial_local(p.port).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::info!(port = p.port, "local connect failed: {e}");
-                responder.refuse(ErrorCode::ConnectFailed);
+                confirmed.refuse(ErrorCode::ConnectFailed).await;
                 return;
             }
         };
-        let chan = match responder.accept().await {
+        let chan = match confirmed.accept().await {
             Ok(c) => c,
             Err(e) => {
                 self.record_error(format!("handshake with {} failed: {e}", p.src));
@@ -801,6 +891,38 @@ impl DaemonInner {
         }
     }
 
+    /// The key pinned for `name`, if any (an unreadable store is an error).
+    fn pinned_key(&self, name: &str) -> Result<Option<[u8; 32]>, OpenError> {
+        KnownPeers::load(&self.cfg.paths)
+            .map(|k| k.pinned(name))
+            .map_err(|e| OpenError::Other(format!("{e:#}")))
+    }
+
+    /// The key to use for `dest`: the pinned one, or on first contact the
+    /// relay's (then pinned). Concurrent first contacts share one lookup.
+    async fn peer_key(&self, session: &Arc<Session>, dest: &str) -> Result<[u8; 32], OpenError> {
+        if let Some(k) = self.pinned_key(dest)? {
+            return Ok(k);
+        }
+        let _g = self.lookup_lock.lock().await;
+        if let Some(k) = self.pinned_key(dest)? {
+            return Ok(k);
+        }
+        let info = session
+            .lookup(dest)
+            .await
+            .map_err(|f| match f.code.as_str() {
+                "no_such_node" => OpenError::NoSuchNode(dest.to_string()),
+                "not_connected" => OpenError::NotConnected,
+                _ => OpenError::Other(f.message),
+            })?;
+        let k = info
+            .static_key()
+            .ok_or_else(|| OpenError::Other("relay returned a malformed key".into()))?;
+        self.pin_peer(dest, &k).await?;
+        Ok(k)
+    }
+
     /// Open an end-to-end encrypted stream to `dest:port`.
     pub async fn open_private(
         self: &Arc<Self>,
@@ -811,26 +933,7 @@ impl DaemonInner {
             .wait_session(SESSION_WAIT)
             .await
             .ok_or(OpenError::NotConnected)?;
-        let pinned = KnownPeers::load(&self.cfg.paths)
-            .map_err(|e| OpenError::Other(format!("{e:#}")))?
-            .pinned(dest);
-        let key = match pinned {
-            Some(k) => k,
-            None => {
-                let info = session
-                    .lookup(dest)
-                    .await
-                    .map_err(|f| match f.code.as_str() {
-                        "no_such_node" => OpenError::NoSuchNode(dest.to_string()),
-                        _ => OpenError::Other(f.message),
-                    })?;
-                let k = info
-                    .static_key()
-                    .ok_or_else(|| OpenError::Other("relay returned a malformed key".into()))?;
-                self.pin_peer(dest, &k).await?;
-                k
-            }
-        };
+        let key = self.peer_key(&session, dest).await?;
         let (tx, rx) = session
             .open(dest, port)
             .await
@@ -848,8 +951,22 @@ impl DaemonInner {
             dest: dest.to_string(),
             port,
         };
+        let refused = |code: ErrorCode| {
+            let message = match code {
+                ErrorCode::KeyChanged => "the destination has a different key pinned for this node (it may need `warren trust`)".to_string(),
+                ErrorCode::ConnectFailed => format!("nothing is listening on port {port} there"),
+                _ => "the destination refused the stream".to_string(),
+            };
+            OpenError::Refused {
+                code,
+                node: dest.to_string(),
+                message,
+            }
+        };
         match noise::initiate(tx, rx, &self.id, &key, &hello).await {
             Ok(c) => Ok(c),
+            // Refused after a completed handshake: the reason is authentic.
+            Err(noise::NoiseError::Refused(code)) => Err(refused(code)),
             Err(e) => {
                 // Distinguish a changed key from other failures.
                 if let Ok(info) = session.lookup(dest).await {
@@ -875,16 +992,7 @@ impl DaemonInner {
                         .into_iter()
                         .find(|c| msg.contains(c.name()))
                         .unwrap_or(ErrorCode::Aborted);
-                        let message = match code {
-                            ErrorCode::KeyChanged => "the destination has a different key pinned for this node (it may need `warren trust`)".to_string(),
-                            ErrorCode::ConnectFailed => format!("nothing is listening on port {port} there"),
-                            _ => "the destination refused the stream".to_string(),
-                        };
-                        return Err(OpenError::Refused {
-                            code,
-                            node: dest.to_string(),
-                            message,
-                        });
+                        return Err(refused(code));
                     }
                 }
                 Err(OpenError::Handshake(dest.to_string(), e.to_string()))
@@ -1149,40 +1257,55 @@ impl DaemonInner {
                 let Some(session) = self.wait_session(SESSION_WAIT).await else {
                     return ControlResponse::err("not_connected", "not connected to the relay");
                 };
-                match session.ctrl(CtrlOp::Devices).await {
-                    Ok(v) => {
-                        let list: Vec<DeviceInfo> = serde_json::from_value(v).unwrap_or_default();
-                        let known = KnownPeers::load(&self.cfg.paths).unwrap_or_default();
-                        let out: Vec<Value> = list
-                            .iter()
-                            .map(|d| {
-                                let key = d.static_key().unwrap_or([0; 32]);
-                                let me = d.name == self.ident.name;
-                                let pin = if me {
-                                    "self"
-                                } else {
-                                    match known.check(&d.name, &key) {
-                                        PinCheck::Match => "pinned",
-                                        PinCheck::New => "new",
-                                        PinCheck::Changed { .. } => "changed",
-                                    }
-                                };
-                                json!({
-                                    "name": d.name,
-                                    "node_id": d.node_id,
-                                    "fingerprint": crypto::fingerprint(&key),
-                                    "online": d.online,
-                                    "last_seen": d.last_seen,
-                                    "pin": pin,
-                                })
-                            })
-                            .collect();
-                        ControlResponse::ok(Value::Array(out))
-                    }
-                    Err(f) => ControlResponse::err(&f.code, f.message),
+                let list = match fetch_devices(&session).await {
+                    Ok(l) => l,
+                    Err(f) => return ControlResponse::err(&f.code, f.message),
+                };
+                let known = KnownPeers::load(&self.cfg.paths);
+                if let Err(e) = &known {
+                    self.record_error(format!("reading pinned keys: {e:#}"));
                 }
+                let out: Vec<Value> = list
+                    .iter()
+                    .map(|d| {
+                        let key = d.static_key().unwrap_or([0; 32]);
+                        let fingerprint = crypto::fingerprint(&key);
+                        let me = d.name == self.ident.name;
+                        let pin = if me {
+                            "self"
+                        } else {
+                            match &known {
+                                Err(_) => "unreadable",
+                                Ok(k) => match k.check(&d.name, &key) {
+                                    PinCheck::Match => "pinned",
+                                    PinCheck::New => "new",
+                                    PinCheck::Changed { .. } => "changed",
+                                },
+                            }
+                        };
+                        // Names come from the relay: make them safe to print.
+                        let name = crate::sanitize_remote_text(&d.name);
+                        let mut v = json!({
+                            "name": name,
+                            "node_id": crate::sanitize_remote_text(&d.node_id),
+                            "fingerprint": fingerprint,
+                            "online": d.online,
+                            "last_seen": d.last_seen,
+                            "pin": pin,
+                        });
+                        if pin == "changed" && crate::valid_name(&d.name) {
+                            v["trust"] =
+                                json!(format!("warren trust {} --expect {fingerprint}", d.name));
+                        }
+                        v
+                    })
+                    .collect();
+                ControlResponse::ok(Value::Array(out))
             }
             ControlRequest::Trust { name, expect } => {
+                if !crate::valid_name(&name) {
+                    return ControlResponse::err("bad_request", format!("invalid name {name:?}"));
+                }
                 let Some(session) = self.wait_session(SESSION_WAIT).await else {
                     return ControlResponse::err("not_connected", "not connected to the relay");
                 };
@@ -1194,18 +1317,51 @@ impl DaemonInner {
                     return ControlResponse::err("protocol", "malformed key from relay");
                 };
                 let current = crypto::fingerprint(&key);
-                if let Some(e) = expect {
-                    let norm = |s: &str| s.to_ascii_lowercase().replace([':', ' ', '-'], "");
-                    if norm(&e) != norm(&current) {
+                let _g = self.peers_lock.lock().await;
+                // Never rewrite a store that cannot be read: that would drop
+                // every other pin and silently return those peers to
+                // trust-on-first-use.
+                let mut k = match KnownPeers::load(&self.cfg.paths) {
+                    Ok(k) => k,
+                    Err(e) => {
                         return ControlResponse::err(
-                            "fingerprint_mismatch",
-                            format!("{name} currently has fingerprint {current}, not {e}"),
-                        );
+                            "pin_store_unreadable",
+                            format!(
+                                "{e:#}; nothing was changed. Repair {} (or move it away, which forgets every pinned key) and try again",
+                                self.cfg.paths.known_peers().display()
+                            ),
+                        )
+                    }
+                };
+                let previous = k.pinned(&name);
+                let previous_fp = previous.map(|p| crypto::fingerprint(&p));
+                match &expect {
+                    Some(e) => {
+                        let norm = |s: &str| s.to_ascii_lowercase().replace([':', ' ', '-'], "");
+                        if norm(e) != norm(&current) {
+                            return ControlResponse::err(
+                                "fingerprint_mismatch",
+                                format!("{name} currently has fingerprint {current}, not {e}"),
+                            );
+                        }
+                    }
+                    // Replacing a pinned key needs the fingerprint the user
+                    // verified; otherwise the relay could hand over a
+                    // different key between showing one and this lookup.
+                    None => {
+                        if let Some(prev) = previous {
+                            if !crypto::ct_eq(&prev, &key) {
+                                return ControlResponse::err(
+                                    "fingerprint_required",
+                                    format!(
+                                        "the key of {name} changed: pinned {}, the relay now reports {current}. Check the fingerprint on {name} itself (`warren status` there), then run `warren trust {name} --expect {current}`",
+                                        previous_fp.as_deref().unwrap_or_default()
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
-                let _g = self.peers_lock.lock().await;
-                let mut k = KnownPeers::load(&self.cfg.paths).unwrap_or_default();
-                let previous = k.pinned(&name).map(|p| crypto::fingerprint(&p));
                 if k.relay.is_empty() {
                     k.relay = self.ident.relay.clone();
                 }
@@ -1215,9 +1371,9 @@ impl DaemonInner {
                 }
                 ControlResponse::ok(json!({
                     "name": name,
-                    "previous": previous,
+                    "previous": previous_fp,
                     "current": current,
-                    "changed": previous.as_deref() != Some(current.as_str()),
+                    "changed": previous_fp.as_deref() != Some(current.as_str()),
                 }))
             }
             ControlRequest::Open { .. } => ControlResponse::err("bad_request", "unexpected open"),
@@ -1278,6 +1434,34 @@ impl DaemonInner {
         }
         let resp = self.handle_request(req).await;
         let _ = write_resp(&mut w, &resp).await;
+    }
+}
+
+/// Every registered node, fetched page by page.
+async fn fetch_devices(session: &Session) -> Result<Vec<DeviceInfo>, CtrlFailure> {
+    let mut list: Vec<DeviceInfo> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let v = session
+            .ctrl(CtrlOp::Devices {
+                offset,
+                limit: None,
+            })
+            .await?;
+        let page: DevicesPage = serde_json::from_value(v)
+            .map_err(|_| CtrlFailure::new("protocol", "malformed devices reply"))?;
+        list.extend(page.devices);
+        match page.next {
+            None => return Ok(list),
+            // A relay must make progress and stay within reason.
+            Some(n) if n > offset && list.len() < 1_000_000 => offset = n,
+            Some(_) => {
+                return Err(CtrlFailure::new(
+                    "protocol",
+                    "inconsistent devices paging from the relay",
+                ))
+            }
+        }
     }
 }
 
