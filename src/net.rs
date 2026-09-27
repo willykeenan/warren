@@ -1,8 +1,9 @@
 //! The only place the binary opens outbound TCP connections.
 //!
-//! Warren connects to exactly two kinds of destination:
+//! Warren connects to exactly three kinds of destination:
 //!
 //! * the configured relay ([`dial_relay`]), and
+//! * exact validated LAN gateway targets ([`dial_gateway`]), and
 //! * services on the local machine's loopback interface ([`dial_local`]),
 //!   which is how shares and publishes reach the service they expose.
 //!
@@ -129,9 +130,225 @@ pub async fn accepted<T>(r: io::Result<T>, what: &str) -> Option<T> {
     }
 }
 
+/// Resolve both endpoints for each gateway connection. Only the complete,
+/// validated numeric result may be dialed; no hostname reaches connect here.
+pub async fn dial_gateway(
+    target: &crate::gateway_policy::GatewayTarget,
+    relay: &RelayUrl,
+    connected_relay_ips: &[IpAddr],
+) -> io::Result<TcpStream> {
+    dial_gateway_resolved(
+        target,
+        relay,
+        connected_relay_ips,
+        |host, port| async move {
+            Ok(tokio::net::lookup_host((host, port))
+                .await?
+                .take(33)
+                .collect())
+        },
+    )
+    .await
+}
+
+// The same resolver boundary is injected by tests; dialing remains numeric-only.
+async fn dial_gateway_resolved<F, R>(
+    target: &crate::gateway_policy::GatewayTarget,
+    relay: &RelayUrl,
+    connected_relay_ips: &[IpAddr],
+    resolve: F,
+) -> io::Result<TcpStream>
+where
+    F: Fn(String, u16) -> R,
+    R: std::future::Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    let stream =
+        dial_gateway_resolved_with_dial(target, relay, connected_relay_ips, resolve, |address| {
+            TcpStream::connect(address)
+        })
+        .await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+// A numeric-dial seam keeps policy ordering independently testable without I/O.
+// The production wrapper above is the only caller that opens gateway sockets.
+async fn dial_gateway_resolved_with_dial<F, R, D, C, T>(
+    target: &crate::gateway_policy::GatewayTarget,
+    relay: &RelayUrl,
+    connected_relay_ips: &[IpAddr],
+    resolve: F,
+    dial: D,
+) -> io::Result<T>
+where
+    F: Fn(String, u16) -> R,
+    R: std::future::Future<Output = io::Result<Vec<SocketAddr>>>,
+    D: Fn(SocketAddr) -> C,
+    C: std::future::Future<Output = io::Result<T>>,
+{
+    let attempt = async {
+        let (target_result, relay_result) = tokio::join!(
+            resolve(target.host.clone(), target.port),
+            resolve(relay.host.clone(), relay.port),
+        );
+        let addresses = target_result?;
+        let mut relay_addresses: Vec<_> = relay_result?.into_iter().map(|a| a.ip()).collect();
+        if relay_addresses.len() > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "too many relay addresses",
+            ));
+        }
+        if relay_addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "empty relay resolution",
+            ));
+        }
+        relay_addresses.extend_from_slice(connected_relay_ips);
+        let valid = crate::gateway_policy::validate_resolved(target, &addresses, &relay_addresses)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "gateway address policy refused",
+                )
+            })?;
+        let mut last = io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "no validated gateway address connected",
+        );
+        for address in valid {
+            match dial(address).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    };
+    tokio::time::timeout(Duration::from_secs(5), attempt)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gateway resolve/connect timed out"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gateway_resolution_rejects_whole_poisoned_sets_and_relay_aliases() {
+        let target = crate::gateway_policy::GatewayTarget::parse("camera.local:554").unwrap();
+        let relay = RelayUrl::parse("https://relay.example:443").unwrap();
+        let private: SocketAddr = "192.168.1.7:554".parse().unwrap();
+        let public: SocketAddr = "8.8.8.8:554".parse().unwrap();
+        for (answers, relay_answers, connected) in [
+            (
+                vec![private, public],
+                vec!["1.1.1.1:443".parse().unwrap()],
+                vec![],
+            ),
+            (vec![public], vec!["1.1.1.1:443".parse().unwrap()], vec![]),
+            (
+                vec![private],
+                vec!["192.168.1.7:443".parse().unwrap()],
+                vec![],
+            ),
+            (vec![private], vec![], vec![]),
+            (
+                vec![private],
+                vec!["1.1.1.1:443".parse().unwrap()],
+                vec![private.ip()],
+            ),
+            (
+                vec![private; 33],
+                vec!["1.1.1.1:443".parse().unwrap()],
+                vec![],
+            ),
+            (
+                vec![private],
+                vec!["1.1.1.1:443".parse().unwrap(); 33],
+                vec![],
+            ),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = dial_gateway_resolved_with_dial(
+                &target,
+                &relay,
+                &connected,
+                |host, port| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let resolved = if host == target.host {
+                        assert_eq!(port, 554);
+                        answers.clone()
+                    } else {
+                        assert_eq!(host, relay.host);
+                        assert_eq!(port, 443);
+                        relay_answers.clone()
+                    };
+                    async { Ok(resolved) }
+                },
+                |_address| async {
+                    panic!("unsafe answer set reached numeric dial");
+                    #[allow(unreachable_code)]
+                    Ok::<(), io::Error>(())
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_reresolves_before_each_numeric_dial() {
+        let address: SocketAddr = "192.168.1.7:554".parse().unwrap();
+        let target = crate::gateway_policy::GatewayTarget::parse("camera.local:554").unwrap();
+        let relay = RelayUrl::parse("https://relay.example").unwrap();
+        let resolutions = std::sync::Mutex::new(Vec::new());
+        let dials = std::sync::Mutex::new(Vec::new());
+        for (attempt, poisoned) in [false, true].into_iter().enumerate() {
+            let result = dial_gateway_resolved_with_dial(
+                &target,
+                &relay,
+                &[],
+                |host, port| {
+                    resolutions.lock().unwrap().push((host.clone(), port));
+                    let answers = if host == target.host {
+                        if poisoned {
+                            vec![address, "8.8.8.8:554".parse().unwrap()]
+                        } else {
+                            vec![address]
+                        }
+                    } else {
+                        vec!["1.1.1.1:443".parse().unwrap()]
+                    };
+                    async move { Ok(answers) }
+                },
+                |numeric| {
+                    dials.lock().unwrap().push(numeric);
+                    async move { Ok(numeric) }
+                },
+            )
+            .await;
+            if poisoned {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            } else {
+                assert_eq!(result.unwrap(), address);
+            }
+            // Both endpoints must be freshly resolved, including the denied attempt.
+            let expected: Vec<_> = (0..=attempt)
+                .flat_map(|_| {
+                    [
+                        (target.host.clone(), target.port),
+                        (relay.host.clone(), relay.port),
+                    ]
+                })
+                .collect();
+            assert_eq!(*resolutions.lock().unwrap(), expected);
+            // The first allowed set dials its exact numeric address once. The later
+            // mixed private/public set must be rejected before ANY numeric dial.
+            assert_eq!(*dials.lock().unwrap(), vec![address]);
+        }
+    }
 
     #[tokio::test]
     async fn failed_accepts_pause() {

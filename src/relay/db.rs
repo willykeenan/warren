@@ -466,8 +466,8 @@ mod tests {
     fn invites_are_single_use_expire_and_hashed() {
         let t = tempfile::tempdir().unwrap();
         let db = Db::open(t.path()).unwrap();
-        assert_eq!(fsutil::mode_of(t.path()).unwrap(), 0o700);
-        assert_eq!(fsutil::mode_of(db.path()).unwrap(), 0o600);
+        assert!(fsutil::is_private(t.path()).unwrap());
+        assert!(fsutil::is_private(db.path()).unwrap());
         let now = 1_000_000;
         let code = db
             .create_invite(None, Duration::from_secs(600), now)

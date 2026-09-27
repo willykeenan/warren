@@ -242,3 +242,12 @@ Each connection uses a file descriptor. At startup the relay raises its soft
 open-file limit towards 65536 (never above the hard limit) and logs the
 result; if the hard limit is too low for 16384 connections it warns, and you
 should raise it (`LimitNOFILE=` in the systemd unit above, or `ulimit -Hn`).
+
+## Windows candidate limitations
+
+The relay's Windows code is not qualified for production. The default state is
+`%LOCALAPPDATA%\warren\relay`. Keep SQLite state paths below 260 characters.
+Windows firewall rules, IPv4/IPv6 binding and ports reserved by HTTP.sys need
+platform checks. There is no Windows relay service installer. ACME certificate
+filenames for Windows reserved device names are not yet qualified; use Linux
+for relay hosting. Ctrl+C/Ctrl+Break request graceful shutdown in the foreground.

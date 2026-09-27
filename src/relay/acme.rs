@@ -92,6 +92,8 @@ impl AcmeManager {
                 continue;
             };
             let (c, k) = self.paths(&host);
+            #[cfg(unix)]
+            fsutil::ensure_private_file(&k)?;
             match crate::tls::load_cert_files(&c, &k) {
                 Ok(ck) => {
                     if let Ok(na) = not_after_unix(ck.cert[0].as_ref()) {
@@ -150,6 +152,8 @@ impl AcmeManager {
     async fn account(&self) -> Result<instant_acme::Account> {
         use instant_acme::{Account, AccountCredentials, NewAccount};
         let cred_path = self.dir.join("account.json");
+        #[cfg(unix)]
+        fsutil::ensure_private_file(&cred_path)?;
         if let Some(creds) = fsutil::read_json::<AccountCredentials>(&cred_path)? {
             return Ok(Account::builder()?.from_credentials(creds).await?);
         }
@@ -414,11 +418,8 @@ mod tests {
         assert!(resolver.has_host("web.example"));
         assert!(!m.wants("web.example", crate::now_secs()));
         assert!(m.wants("other.example", crate::now_secs()));
-        assert_eq!(
-            fsutil::mode_of(&t.path().join("certs/web.example.key")).unwrap(),
-            0o600
-        );
-        assert_eq!(fsutil::mode_of(&t.path().join("certs")).unwrap(), 0o700);
+        assert!(fsutil::is_private(&t.path().join("certs/web.example.key")).unwrap());
+        assert!(fsutil::is_private(&t.path().join("certs")).unwrap());
         // A fresh manager reloads from disk.
         let r2 = Arc::new(CertResolver::new());
         let m2 = AcmeManager::new(

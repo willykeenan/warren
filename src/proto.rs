@@ -34,6 +34,8 @@ pub const MAX_CTRL_PAYLOAD: usize = MAX_PAYLOAD;
 
 /// OPEN flag: the stream carries public (published) traffic terminated at the relay.
 pub const FLAG_PUBLIC: u8 = 0x01;
+/// Named encrypted gateway selector. Always paired with the port-zero sentinel.
+pub const FLAG_GATEWAY: u8 = 0x02;
 
 /// Stream id used for connection-level frames (PING, PONG, CTRL).
 pub const CONTROL_STREAM: u32 = 0;
@@ -304,6 +306,14 @@ pub struct OpenPayload {
 }
 
 impl OpenPayload {
+    pub fn is_gateway(&self) -> bool {
+        self.flags == FLAG_GATEWAY && self.port == 0
+    }
+
+    pub fn valid_private_selector(&self) -> bool {
+        (self.flags == 0 && self.port != 0) || self.is_gateway()
+    }
+
     pub fn is_public(&self) -> bool {
         self.flags & FLAG_PUBLIC != 0
     }

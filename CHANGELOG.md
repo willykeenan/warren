@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 semantic versioning.
 
+## Unreleased
+
+- Named gateway shares for exact LAN targets, peer-key authorization, DNS rebinding
+  checks on every connection, access revocation and required local audit records.
+- Gateway-local device discovery and an authenticated device API. Native phone
+  enrollment, device viewers and real-device phone acceptance remain pending.
+
+- Windows source candidate: private ACLs, local named-pipe control with framed
+  half-close, per-user logon task, console signals, and OpenSSH argument handling.
+- Windows x64 CI and tag-only ZIP build definitions. Native x64 unit and integration
+  tests pass; Task Scheduler lifecycle, hostile-token tests and ARM64 qualification
+  remain pending. This entry does not describe a released build.
+- Portable framing and SDDL tests; Windows ACL and pipe-instance tests.
+
 ## [0.1.0] - 2026-09-27
 
 First release. See *Status and limitations* in the README for what has and

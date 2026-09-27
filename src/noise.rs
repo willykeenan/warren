@@ -49,6 +49,8 @@ pub struct Hello {
     pub src: String,
     pub dest: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -378,8 +380,11 @@ impl SecureReceiver {
         while let Some(p) = self.recv().await? {
             total += p.len() as u64;
             w.write_all(&p).await?;
+            // Framed control output buffers a payload until flushed. Deliver it
+            // before awaiting the peer again (SSH banners must not need EOF).
+            w.flush().await?;
         }
-        let _ = w.shutdown().await;
+        w.shutdown().await?;
         // Wait for the peer's FIN (bounded) so the stream is fully closed.
         let _ = tokio::time::timeout(Duration::from_secs(5), self.rx.recv()).await;
         Ok(total)
@@ -456,6 +461,7 @@ mod tests {
         let ia = Identity::generate();
         let ib = Identity::generate();
         let hello = Hello {
+            share: None,
             v: 1,
             src: "a".into(),
             dest: "b".into(),
@@ -496,6 +502,7 @@ mod tests {
         let ib = Identity::generate();
         let impostor = Identity::generate();
         let hello = Hello {
+            share: None,
             v: 1,
             src: "a".into(),
             dest: "b".into(),
@@ -519,6 +526,7 @@ mod tests {
         let ia = Identity::generate();
         let ib = Identity::generate();
         let hello = Hello {
+            share: None,
             v: 1,
             src: "a".into(),
             dest: "b".into(),
@@ -551,6 +559,7 @@ mod tests {
         let ia = Identity::generate();
         let ib = Identity::generate();
         let hello = Hello {
+            share: None,
             v: 1,
             src: "a".into(),
             dest: "b".into(),
@@ -591,6 +600,7 @@ mod tests {
         let ia = Identity::generate();
         let ib = Identity::generate();
         let hello = Hello {
+            share: None,
             v: 1,
             src: "a".into(),
             dest: "b".into(),

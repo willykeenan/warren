@@ -16,6 +16,8 @@ fn run_home(root: &Path, home: &Path, args: &[&str]) -> (i32, String, String) {
     std::fs::create_dir_all(root.join("fakehome")).unwrap();
     let o = Command::new(BIN)
         .env("HOME", root.join("fakehome"))
+        .env("LOCALAPPDATA", root.join("fakehome"))
+        .env("WARREN_TASK_DIR", root.join("tasks"))
         .env("WARREN_HOME", home)
         .env("WARREN_LAUNCHD_DIR", root.join("launchd"))
         .env("WARREN_SYSTEMD_DIR", root.join("systemd"))
@@ -105,6 +107,7 @@ fn json_flag_also_covers_argument_errors() {
 
 /// A WARREN_HOME too long to hold the control socket is refused before
 /// enrolling (so the code is not used up), and other commands explain it.
+#[cfg(unix)]
 #[test]
 fn too_long_warren_home_is_explained() {
     let t = tempfile::tempdir().unwrap();

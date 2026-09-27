@@ -3,6 +3,7 @@
 //! private streams, forwards, publishes and the local control socket.
 
 use super::control::{self, ControlRequest, ControlResponse};
+use super::ipc;
 use super::{
     Forward, ForwardsFile, IdentityFile, KnownPeers, NodePaths, PinCheck, Publish, PublishesFile,
     ShareDecision, SharesFile,
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -223,10 +224,19 @@ impl Session {
         dest: &str,
         port: u16,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        self.open_mode(dest, port, 0).await
+    }
+
+    async fn open_mode(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        flags: u8,
+    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
         let deadline = Instant::now() + SESSION_WAIT;
         loop {
             self.pace_open().await;
-            match self.open_once(dest, port).await {
+            match self.open_once(dest, port, flags).await {
                 Err((ErrorCode::RateLimited, _)) if Instant::now() < deadline => {
                     tokio::time::sleep(retry_jitter(20, 80)).await;
                 }
@@ -239,6 +249,7 @@ impl Session {
         self: &Arc<Self>,
         dest: &str,
         port: u16,
+        flags: u8,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
         let (tx, rx, reply, id) = {
             let mut t = self.table.lock().unwrap();
@@ -260,6 +271,7 @@ impl Session {
             (tx, rx, reply.expect("outgoing"), id)
         };
         let p = OpenPayload {
+            flags,
             port,
             dest: dest.to_string(),
             ..Default::default()
@@ -318,6 +330,7 @@ pub struct DaemonInner {
     /// new peer asks the relay once.
     lookup_lock: tokio::sync::Mutex<()>,
     pub shutdown: CancellationToken,
+    gateway: Arc<super::gateway::GatewayRuntime>,
 }
 
 /// A running daemon.
@@ -332,7 +345,7 @@ impl DaemonHandle {
         for t in self.tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
         }
-        let _ = std::fs::remove_file(self.inner.cfg.paths.socket());
+        ipc::cleanup(&self.inner.cfg.paths);
     }
 
     /// Wait until connected to the relay.
@@ -357,12 +370,20 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
     let paths = cfg.paths.clone();
     paths.ensure()?;
+    #[cfg(unix)]
+    crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
     let id = ident.identity()?;
     let relay = ident.relay_url()?;
     let pin = ident.pin()?;
     let publishes = PublishesFile::load(&paths)?.publishes;
     let (session_tx, _) = watch::channel(None);
+    let gateway = super::gateway::GatewayRuntime::new(
+        paths.clone(),
+        id.clone(),
+        ident.name.clone(),
+        relay.clone(),
+    )?;
     let inner = Arc::new(DaemonInner {
         cfg,
         ident,
@@ -382,10 +403,16 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         peers_lock: tokio::sync::Mutex::new(()),
         lookup_lock: tokio::sync::Mutex::new(()),
         shutdown: CancellationToken::new(),
+        gateway,
     });
 
-    let listener = bind_control(&paths).await?;
+    let listener = ipc::bind(&paths).await?;
     let mut tasks = Vec::new();
+    {
+        let g = inner.gateway.clone();
+        let stop = inner.shutdown.clone();
+        tasks.push(tokio::spawn(async move { g.watch(stop).await }));
+    }
     {
         let d = inner.clone();
         tasks.push(tokio::spawn(async move { d.serve_control(listener).await }));
@@ -412,20 +439,6 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     }
     tracing::info!(node = %inner.ident.name, relay = %inner.relay.https(), open_files, "warren node started");
     Ok(DaemonHandle { inner, tasks })
-}
-
-async fn bind_control(paths: &NodePaths) -> Result<UnixListener> {
-    let sock = paths.checked_socket()?;
-    if sock.exists() {
-        if UnixStream::connect(&sock).await.is_ok() {
-            anyhow::bail!("warren is already running for {}", paths.home.display());
-        }
-        let _ = std::fs::remove_file(&sock);
-    }
-    let l = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
 }
 
 impl DaemonInner {
@@ -513,6 +526,8 @@ impl DaemonInner {
             _ = self.shutdown.cancelled() => return Ok("shutting down"),
             r = crate::ws::connect_relay(&self.relay, self.pin) => r?,
         };
+        self.gateway
+            .relay_connected(ws.get_ref().get_ref().0.peer_addr()?.ip());
         let challenge = super::read_challenge(&mut ws).await?;
         let hello = NodeHello::Auth {
             version: PROTOCOL_VERSION,
@@ -651,6 +666,14 @@ impl DaemonInner {
                 .send(Frame::open_err(id, ErrorCode::BadRequest, "malformed OPEN"));
             return;
         };
+        if !(p.valid_private_selector() || (p.flags == FLAG_PUBLIC && p.port == 0)) {
+            session.out.send(Frame::open_err(
+                id,
+                ErrorCode::BadRequest,
+                "unsupported selector",
+            ));
+            return;
+        }
         let (tx, rx) = {
             let mut t = session.table.lock().unwrap();
             if t.contains_key(&id) {
@@ -670,6 +693,10 @@ impl DaemonInner {
             t.insert(id, slot);
             (tx, rx)
         };
+        if p.is_gateway() {
+            self.gateway.spawn(p, tx, rx);
+            return;
+        }
         let d = self.clone();
         tokio::spawn(async move {
             if p.is_public() {
@@ -767,7 +794,13 @@ impl DaemonInner {
             return;
         }
         let h = &responder.hello;
-        if h.dest != self.ident.name || h.port != p.port || h.src != p.src {
+        if h.v != 1
+            || h.share.is_some()
+            || h.dest != self.ident.name
+            || h.port != p.port
+            || h.src != p.src
+            || p.dest != self.ident.name
+        {
             self.record_error(format!(
                 "refused connection from {}: request does not match the relay's OPEN",
                 p.src
@@ -930,13 +963,36 @@ impl DaemonInner {
         dest: &str,
         port: u16,
     ) -> Result<SecureChannel, OpenError> {
+        self.open_selected(dest, port, None).await
+    }
+
+    pub async fn open_gateway(
+        self: &Arc<Self>,
+        dest: &str,
+        share: &str,
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected(dest, 0, Some(share.to_string())).await
+    }
+
+    async fn open_selected(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        share: Option<String>,
+    ) -> Result<SecureChannel, OpenError> {
+        if !crate::valid_name(dest)
+            || (share.as_ref().is_some_and(|s| !crate::valid_name(s)))
+            || (share.is_some() != (port == 0))
+        {
+            return Err(OpenError::Other("invalid selector".into()));
+        }
         let session = self
             .wait_session(SESSION_WAIT)
             .await
             .ok_or(OpenError::NotConnected)?;
         let key = self.peer_key(&session, dest).await?;
         let (tx, rx) = session
-            .open(dest, port)
+            .open_mode(dest, port, if share.is_some() { FLAG_GATEWAY } else { 0 })
             .await
             .map_err(|(code, message)| match code {
                 ErrorCode::NoSuchNode => OpenError::NoSuchNode(dest.to_string()),
@@ -947,6 +1003,7 @@ impl DaemonInner {
                 },
             })?;
         let hello = Hello {
+            share,
             v: 1,
             src: self.ident.name.clone(),
             dest: dest.to_string(),
@@ -1056,7 +1113,7 @@ impl DaemonInner {
             let d = self.clone();
             let f = f.clone();
             tokio::spawn(async move {
-                match d.open_private(&f.node, f.port).await {
+                match d.open_selected(&f.node, f.port, f.share.clone()).await {
                     Ok(chan) => {
                         let (r, w) = tcp.into_split();
                         let _ = chan.pipe(r, w).await;
@@ -1078,13 +1135,17 @@ impl DaemonInner {
             .unwrap()
             .values()
             .map(|f| {
-                json!({
+                let mut status = json!({
                     "local": f.fwd.local,
                     "node": f.fwd.node,
                     "port": f.fwd.port,
                     "listening": f.task.is_some(),
                     "error": f.error,
-                })
+                });
+                if let Some(name) = &f.fwd.share {
+                    status["share"] = json!(name);
+                }
+                status
             })
             .collect();
         let publishes: Vec<Value> = self
@@ -1096,6 +1157,7 @@ impl DaemonInner {
             .collect();
         let errors: Vec<ErrorEntry> = self.errors.lock().unwrap().iter().cloned().collect();
         let session = self.current();
+        let gateways = self.gateway.status();
         json!({
             "node": {
                 "name": self.ident.name,
@@ -1112,15 +1174,79 @@ impl DaemonInner {
             },
             "daemon": { "running": true, "pid": std::process::id() },
             "shares": shares.shares,
+            "gateway_audit": self.gateway.audit_health(),
+            "gateway_count": gateways.len(),
+            "gateways": gateways,
             "forwards": forwards,
             "publishes": publishes,
             "recent_errors": errors,
         })
     }
 
+    async fn add_forward(self: &Arc<Self>, f: Forward) -> ControlResponse {
+        let local = f.local;
+        // Replacing a forward on the same port: stop the old listener first.
+        let old = self.forwards.lock().unwrap().remove(&local);
+        if let Some(ForwardState { task: Some(t), .. }) = old {
+            t.abort();
+            let _ = t.await;
+        }
+        if let Err(e) = self.start_forward(f.clone()) {
+            return ControlResponse::err("bind_failed", format!("{e:#}"));
+        }
+        let mut file = ForwardsFile::load(&self.cfg.paths).unwrap_or_default();
+        file.forwards.retain(|x| x.local != local);
+        file.forwards.push(f.clone());
+        file.forwards.sort_by_key(|x| x.local);
+        if let Err(e) = file.save(&self.cfg.paths) {
+            return ControlResponse::err("io", format!("{e:#}"));
+        }
+        ControlResponse::ok(serde_json::to_value(f).unwrap_or_default())
+    }
+
     async fn handle_request(self: &Arc<Self>, req: ControlRequest) -> ControlResponse {
         match req {
             ControlRequest::Status => ControlResponse::ok(self.status_json()),
+            ControlRequest::ShareSet { port, to } => {
+                match self.gateway.mutate_local(port, to, false).await {
+                    Ok(_) => ControlResponse::ok(json!({"port":port})),
+                    Err(e) => ControlResponse::err("share_policy", e.to_string()),
+                }
+            }
+            ControlRequest::ShareRemove { port } => {
+                match self.gateway.mutate_local(port, None, true).await {
+                    Ok(removed) => ControlResponse::ok(json!({"port":port,"removed":removed})),
+                    Err(e) => ControlResponse::err("share_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewaySet { name, target, to } => {
+                match self
+                    .gateway
+                    .mutate(Some((name.clone(), target, to)), &name)
+                    .await
+                {
+                    Ok(()) => ControlResponse::ok(json!({"name":name})),
+                    Err(e) => ControlResponse::err("gateway_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewayRemove { name } => {
+                match self.gateway.mutate(None, &name).await {
+                    Ok(()) => ControlResponse::ok(json!({"name":name,"removed":true})),
+                    Err(e) => ControlResponse::err("gateway_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewayForwardAdd { local, node, share } => {
+                if !crate::valid_name(&node) || !crate::valid_name(&share) || local == 0 {
+                    return ControlResponse::err("bad_request", "invalid forward");
+                }
+                self.add_forward(Forward {
+                    local,
+                    node,
+                    port: 0,
+                    share: Some(share),
+                })
+                .await
+            }
             ControlRequest::Shutdown => {
                 self.shutdown.cancel();
                 ControlResponse::ok(json!({"stopping": true}))
@@ -1129,24 +1255,13 @@ impl DaemonInner {
                 if !crate::valid_name(&node) || port == 0 || local == 0 {
                     return ControlResponse::err("bad_request", "invalid forward");
                 }
-                let f = Forward { local, node, port };
-                // Replacing a forward on the same port: stop the old listener first.
-                let old = self.forwards.lock().unwrap().remove(&local);
-                if let Some(ForwardState { task: Some(t), .. }) = old {
-                    t.abort();
-                    let _ = t.await;
-                }
-                if let Err(e) = self.start_forward(f.clone()) {
-                    return ControlResponse::err("bind_failed", format!("{e:#}"));
-                }
-                let mut file = ForwardsFile::load(&self.cfg.paths).unwrap_or_default();
-                file.forwards.retain(|x| x.local != local);
-                file.forwards.push(f.clone());
-                file.forwards.sort_by_key(|x| x.local);
-                if let Err(e) = file.save(&self.cfg.paths) {
-                    return ControlResponse::err("io", format!("{e:#}"));
-                }
-                ControlResponse::ok(serde_json::to_value(f).unwrap_or_default())
+                self.add_forward(Forward {
+                    local,
+                    node,
+                    port,
+                    share: None,
+                })
+                .await
             }
             ControlRequest::ForwardRemove { local } => {
                 let removed = self.forwards.lock().unwrap().remove(&local);
@@ -1377,13 +1492,15 @@ impl DaemonInner {
                     "changed": previous_fp.as_deref() != Some(current.as_str()),
                 }))
             }
-            ControlRequest::Open { .. } => ControlResponse::err("bad_request", "unexpected open"),
+            ControlRequest::Open { .. } | ControlRequest::GatewayOpen { .. } => {
+                ControlResponse::err("bad_request", "unexpected open")
+            }
         }
     }
 
-    async fn serve_control(self: Arc<Self>, l: UnixListener) {
+    async fn serve_control(self: Arc<Self>, mut l: ipc::Listener) {
         loop {
-            let (s, _) = tokio::select! {
+            let s = tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 r = l.accept() => match crate::net::accepted(r, "control socket").await {
                     Some(x) => x,
@@ -1393,11 +1510,11 @@ impl DaemonInner {
             let d = self.clone();
             tokio::spawn(async move { d.control_conn(s).await });
         }
-        let _ = std::fs::remove_file(self.cfg.paths.socket());
+        ipc::cleanup(&self.cfg.paths);
     }
 
-    async fn control_conn(self: Arc<Self>, s: UnixStream) {
-        let (r, mut w) = s.into_split();
+    async fn control_conn(self: Arc<Self>, s: ipc::Server) {
+        let (r, mut w) = tokio::io::split(s);
         let mut r = tokio::io::BufReader::new(r);
         let line =
             match tokio::time::timeout(Duration::from_secs(10), control::read_line(&mut r)).await {
@@ -1415,8 +1532,19 @@ impl DaemonInner {
                 return;
             }
         };
-        if let ControlRequest::Open { node, port } = req {
-            match self.open_private(&node, port).await {
+        let open = match &req {
+            ControlRequest::Open { node, port, framed } => {
+                Some((node.clone(), *port, None, *framed))
+            }
+            ControlRequest::GatewayOpen {
+                node,
+                share,
+                framed,
+            } => Some((node.clone(), 0, Some(share.clone()), *framed)),
+            _ => None,
+        };
+        if let Some((node, port, share, framed)) = open {
+            match self.open_selected(&node, port, share).await {
                 Ok(chan) => {
                     if write_resp(
                         &mut w,
@@ -1427,7 +1555,16 @@ impl DaemonInner {
                     {
                         return;
                     }
-                    let _ = chan.pipe(r, w).await;
+                    if framed {
+                        let _ = chan
+                            .pipe(
+                                super::framed::FramedRead::new(r),
+                                super::framed::FramedWrite::new(w),
+                            )
+                            .await;
+                    } else {
+                        let _ = chan.pipe(r, w).await;
+                    }
                 }
                 Err(e) => {
                     let _ =
@@ -1484,22 +1621,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let h = start(cfg).await?;
     let token = h.inner.shutdown.clone();
     tokio::spawn(async move {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-            _ = token.cancelled() => {}
-        }
+        let Ok(signal) = crate::sys::shutdown_signal() else {
+            return;
+        };
+        tokio::select! { _ = signal => {}, _ = token.cancelled() => {} }
         token.cancel();
     });
     let paths = h.inner.cfg.paths.clone();
     h.inner.shutdown.cancelled().await;
     h.wait().await;
-    let _ = std::fs::remove_file(paths.socket());
+    ipc::cleanup(&paths);
     tracing::info!("warren node stopped");
     Ok(())
 }
