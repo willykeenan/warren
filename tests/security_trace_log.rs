@@ -15,6 +15,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_warren");
 fn cmd(root: &std::path::Path, home: &str, log: &str) -> Command {
     let mut c = Command::new(BIN);
     c.env("HOME", root.join("fakehome"))
+        .env("LOCALAPPDATA", root.join("fakehome"))
+        .env("WARREN_TASK_DIR", root.join("tasks"))
         .env("WARREN_HOME", root.join(home))
         .env("WARREN_LOG", log)
         .env("WARREN_LAUNCHD_DIR", root.join("launchd"))

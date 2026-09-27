@@ -58,6 +58,12 @@ pub struct Cli {
     /// Machine-readable JSON output.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Node home (overrides WARREN_HOME).
+    #[arg(long, global = true)]
+    pub home: Option<PathBuf>,
+    /// Detach the Windows console when running the login task.
+    #[arg(long, global = true, hide = true)]
+    pub background: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -289,6 +295,9 @@ impl From<ControlError> for CliError {
             ControlError::SocketPath(_) => {
                 CliError::new(exit::ERROR, "home_too_long", e.to_string())
             }
+            ControlError::Untrusted => {
+                CliError::new(exit::ERROR, "untrusted_control_pipe", e.to_string())
+            }
             _ => CliError::new(exit::ERROR, "control", e.to_string()),
         }
     }
@@ -370,6 +379,28 @@ fn init_logging(default: &str) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+#[cfg(windows)]
+fn init_background_logging(paths: &NodePaths) -> Result<(), CliError> {
+    paths.ensure()?;
+    crate::fsutil::ensure_private_dir(&paths.logs())?;
+    let path = paths.logs().join("warren.log");
+    crate::fsutil::touch_private(&path)?;
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(anyhow::Error::from)?;
+    let spec = std::env::var("WARREN_LOG").ok();
+    let filter = tracing_subscriber::EnvFilter::try_new(log_directives(spec.as_deref(), "info"))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_directives(None, "info")));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
+    Ok(())
 }
 
 /// Escape control characters (other than newlines and tabs) before text
@@ -461,15 +492,23 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Relay(r) => relay_cmd(r, &out).await,
         Command::Up => {
+            let paths = NodePaths::resolve(cli.home.as_deref())?;
+            #[cfg(unix)]
             init_logging("info");
-            let paths = NodePaths::from_env()?;
+            #[cfg(windows)]
+            if cli.background {
+                init_background_logging(&paths)?;
+                crate::sys::windows::free_console();
+            } else {
+                init_logging("info");
+            }
             IdentityFile::load(&paths)?;
             daemon::run(DaemonConfig::new(paths)).await?;
             Ok(())
         }
         other => {
             init_logging("warn");
-            let paths = NodePaths::from_env()?;
+            let paths = NodePaths::resolve(cli.home.as_deref())?;
             node_cmd(other, &paths, &out).await
         }
     }
@@ -693,12 +732,9 @@ async fn run_relay(r: RelayRun, out: &Out) -> Result<(), CliError> {
     });
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
+    crate::sys::shutdown_signal()
+        .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?
+        .await;
     h.shutdown().await;
     Ok(())
 }
@@ -759,6 +795,23 @@ pub fn check_ssh_destination(destination: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Quote the executable for Windows OpenSSH and MSYS ssh. Reject shell expansions.
+pub fn windows_proxy_quote(s: &str) -> Result<String, String> {
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '%' | '$' | '`'))
+    {
+        return Err(
+            "install warren in a path without quotes, %, $, backticks or control characters".into(),
+        );
+    }
+    let path = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else {
+        s.strip_prefix(r"\\?\").unwrap_or(s).replace('\\', "/")
+    };
+    Ok(format!("\"{path}\""))
 }
 
 /// Arguments for `warren ssh`.
@@ -1092,9 +1145,9 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             };
             let up = async {
                 let mut stdin = tokio::io::stdin();
-                let _ = tokio::io::copy(&mut stdin, &mut w).await;
+                tokio::io::copy(&mut stdin, &mut w).await?;
                 use tokio::io::AsyncWriteExt;
-                let _ = w.shutdown().await;
+                w.shutdown().await
             };
             let down = async {
                 let mut stdout = tokio::io::stdout();
@@ -1109,7 +1162,7 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             let mut up_done = false;
             let res = loop {
                 tokio::select! {
-                    _ = &mut up, if !up_done => up_done = true,
+                    r = &mut up, if !up_done => { r.map_err(anyhow::Error::from)?; up_done = true; },
                     r = &mut down => break r,
                 }
             };
@@ -1125,14 +1178,57 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                 .map_err(|m| CliError::new(exit::USAGE, "usage", m))?;
             let exe = std::env::current_exe()
                 .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
-            let argv = ssh_args(&exe.to_string_lossy(), &destination, port, &args);
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new("ssh").args(&argv).exec();
-            Err(CliError::new(
-                exit::ERROR,
-                "exec",
-                format!("running ssh: {err}"),
-            ))
+            let mut argv = ssh_args(&exe.to_string_lossy(), &destination, port, &args);
+            // Forward --home too: environment inheritance alone cannot carry a CLI override.
+            #[cfg(unix)]
+            {
+                argv[1] = format!(
+                    "ProxyCommand={} --home {} nc %h {port}",
+                    proxy_quote(&exe.to_string_lossy()),
+                    proxy_quote(&paths.home.to_string_lossy())
+                );
+            }
+            #[cfg(windows)]
+            {
+                let quote = |s: &str| {
+                    windows_proxy_quote(s).map_err(|e| CliError::new(exit::USAGE, "usage", e))
+                };
+                argv[1] = format!(
+                    "ProxyCommand={} --home {} nc %h {port}",
+                    quote(&exe.to_string_lossy())?,
+                    quote(&paths.home.to_string_lossy())?
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new("ssh").args(&argv).exec();
+                Err(CliError::new(
+                    exit::ERROR,
+                    "exec",
+                    format!("running ssh: {err}"),
+                ))
+            }
+            #[cfg(windows)]
+            {
+                // Validate before passing the ProxyCommand to either Windows or MSYS ssh.
+                windows_proxy_quote(&exe.to_string_lossy())
+                    .map_err(|e| CliError::new(exit::USAGE, "usage", e))?;
+                let _ctrl_c = tokio::signal::windows::ctrl_c().map_err(anyhow::Error::from)?;
+                let status = std::process::Command::new("ssh")
+                    .args(&argv)
+                    .status()
+                    .map_err(|e| {
+                        CliError::new(
+                            exit::ERROR,
+                            "exec",
+                            format!(
+                                "running ssh: {e}; install the OpenSSH Client optional feature"
+                            ),
+                        )
+                    })?;
+                std::process::exit(status.code().unwrap_or(exit::ERROR));
+            }
         }
         Command::Publish {
             port,
@@ -1231,7 +1327,15 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Install { no_start, dir } => {
             let o = install_opts(paths, dir, !no_start)?;
+            #[cfg(windows)]
+            if o.dir.is_none() && o.start {
+                stop_for_install(paths).await?;
+            }
             let r = install::install(&o)?;
+            #[cfg(windows)]
+            if r.started {
+                wait_for_daemon(paths).await?;
+            }
             let v = serde_json::to_value(&r).unwrap_or_default();
             out.print(&v, || {
                 if r.started {
@@ -1244,6 +1348,10 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Uninstall { dir } => {
             let o = install_opts(paths, dir, false)?;
+            #[cfg(windows)]
+            if o.dir.is_none() {
+                stop_for_install(paths).await?;
+            }
             let r = install::uninstall(&o)?;
             let v = serde_json::to_value(&r).unwrap_or_default();
             out.print(&v, || format!("removed {}", r.path.display()));
@@ -1251,6 +1359,37 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Relay(_) | Command::Up => unreachable!("handled in run"),
     }
+}
+
+#[cfg(windows)]
+async fn stop_for_install(paths: &NodePaths) -> Result<(), CliError> {
+    match control::request(paths, &ControlRequest::Shutdown).await {
+        Ok(r) if r.ok => {}
+        Ok(r) => return Err(from_response(r)),
+        Err(ControlError::NotRunning) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    for _ in 0..100 {
+        if !control::daemon_running(paths).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(CliError::new(
+        exit::ERROR,
+        "install",
+        "the previous daemon did not stop",
+    ))
+}
+#[cfg(windows)]
+async fn wait_for_daemon(paths: &NodePaths) -> Result<(), CliError> {
+    for _ in 0..100 {
+        if control::daemon_running(paths).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(CliError::new(exit::ERROR, "install", "Task Scheduler accepted the start, but the daemon did not become ready; inspect logs/warren.log"))
 }
 
 fn install_opts(
@@ -1261,8 +1400,11 @@ fn install_opts(
     let flavor = Flavor::current()?;
     let exe =
         std::env::current_exe().map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
+    #[cfg(unix)]
     let exe = exe.canonicalize().unwrap_or(exe);
-    let custom_home = std::env::var_os("WARREN_HOME").is_some_and(|v| !v.is_empty());
+    let custom_home = node::default_home()
+        .map(|home| home != paths.home)
+        .unwrap_or(true);
     let home = if paths.home.is_absolute() {
         paths.home.clone()
     } else {
@@ -1353,6 +1495,26 @@ mod tests {
         );
         assert_eq!(a[2], "me@b");
         assert_eq!(a[3], "-v");
+    }
+
+    #[test]
+    fn windows_proxy_quotes_spaces_and_rejects_expansion() {
+        assert_eq!(
+            windows_proxy_quote(r"C:\my tools\warren.exe").unwrap(),
+            "\"C:/my tools/warren.exe\""
+        );
+        for path in [
+            "C:/a%PATH%/warren.exe",
+            "C:/a$b/warren.exe",
+            "C:/a`b/warren.exe",
+            "C:/a\"b/warren.exe",
+        ] {
+            assert!(windows_proxy_quote(path).is_err());
+        }
+        let c =
+            Cli::try_parse_from(["warren", "up", "--background", "--home", "C:/my home"]).unwrap();
+        assert_eq!(c.home, Some(PathBuf::from("C:/my home")));
+        assert!(c.background);
     }
 
     #[test]

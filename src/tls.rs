@@ -152,6 +152,7 @@ pub fn persistent_self_signed(
         crate::fsutil::write_private(&key_path, k.as_bytes())?;
         crate::fsutil::write_private(&cert_path, c.as_bytes())?;
     }
+    crate::fsutil::ensure_private_file(&key_path)?;
     let ck = load_cert_files(&cert_path, &key_path)?;
     let fp = cert_sha256(ck.cert[0].as_ref());
     Ok((ck, fp))
@@ -252,7 +253,7 @@ mod tests {
         assert_eq!(ck.cert[0], ck2.cert[0]);
         for e in std::fs::read_dir(t.path()).unwrap() {
             let p = e.unwrap().path();
-            assert_eq!(crate::fsutil::mode_of(&p).unwrap(), 0o600);
+            assert!(crate::fsutil::is_private(&p).unwrap());
         }
         let r = CertResolver::new();
         assert!(r.lookup(Some("x")).is_none());

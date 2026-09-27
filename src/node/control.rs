@@ -2,12 +2,14 @@
 //! 0700 home directory. Requests and responses are single JSON lines; after a
 //! successful `open`, the socket becomes a raw byte pipe to the remote port.
 
+use super::ipc;
 use super::NodePaths;
 use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+pub type PipeRead = Box<dyn AsyncRead + Send + Unpin>;
+pub type PipeWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// Maximum size of one request line (what the daemon accepts from a client).
 pub const MAX_LINE: u64 = 64 * 1024;
@@ -22,6 +24,8 @@ pub enum ControlRequest {
     Open {
         node: String,
         port: u16,
+        #[serde(default)]
+        framed: bool,
     },
     ForwardAdd {
         local: u16,
@@ -86,27 +90,14 @@ impl ControlResponse {
 pub enum ControlError {
     #[error("warren is not running here; start it with `warren up` (or `warren install`)")]
     NotRunning,
+    #[error("the control pipe is owned by another account; possible impersonation")]
+    Untrusted,
     #[error(transparent)]
     SocketPath(#[from] super::SocketPathTooLong),
     #[error("control socket: {0}")]
     Io(#[from] io::Error),
     #[error("malformed reply from the daemon")]
     Protocol,
-}
-
-async fn connect(paths: &NodePaths) -> Result<UnixStream, ControlError> {
-    match UnixStream::connect(paths.checked_socket()?).await {
-        Ok(s) => Ok(s),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Err(ControlError::NotRunning)
-        }
-        Err(e) => Err(e.into()),
-    }
 }
 
 /// Read one JSON request line (at most [`MAX_LINE`] bytes).
@@ -141,8 +132,8 @@ pub async fn request(
     paths: &NodePaths,
     req: &ControlRequest,
 ) -> Result<ControlResponse, ControlError> {
-    let s = connect(paths).await?;
-    let (r, mut w) = s.into_split();
+    let s = ipc::connect(paths).await?;
+    let (r, mut w) = tokio::io::split(s);
     let mut line = serde_json::to_vec(req).map_err(|_| ControlError::Protocol)?;
     line.push(b'\n');
     w.write_all(&line).await?;
@@ -155,10 +146,7 @@ pub async fn request(
 
 /// True if a daemon answers on this home's control socket.
 pub async fn daemon_running(paths: &NodePaths) -> bool {
-    let Ok(sock) = paths.checked_socket() else {
-        return false;
-    };
-    sock.exists() && UnixStream::connect(sock).await.is_ok()
+    ipc::connect(paths).await.is_ok()
 }
 
 /// Ask the daemon to open a private stream; on success returns the pipe.
@@ -166,12 +154,24 @@ pub async fn open(
     paths: &NodePaths,
     node: &str,
     port: u16,
-) -> Result<Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf), ControlResponse>, ControlError> {
-    let s = connect(paths).await?;
-    let (r, mut w) = s.into_split();
+) -> Result<Result<(PipeRead, PipeWrite), ControlResponse>, ControlError> {
+    open_with_framing(paths, node, port, cfg!(windows)).await
+}
+
+/// Select framing explicitly, also used to verify Windows transport semantics on Unix.
+#[doc(hidden)]
+pub async fn open_with_framing(
+    paths: &NodePaths,
+    node: &str,
+    port: u16,
+    framed: bool,
+) -> Result<Result<(PipeRead, PipeWrite), ControlResponse>, ControlError> {
+    let s = ipc::connect(paths).await?;
+    let (r, mut w) = tokio::io::split(s);
     let mut line = serde_json::to_vec(&ControlRequest::Open {
         node: node.to_string(),
         port,
+        framed,
     })
     .map_err(|_| ControlError::Protocol)?;
     line.push(b'\n');
@@ -182,7 +182,14 @@ pub async fn open(
         .ok_or(ControlError::Protocol)?;
     let resp: ControlResponse = serde_json::from_str(&resp).map_err(|_| ControlError::Protocol)?;
     if resp.ok {
-        Ok(Ok((r, w)))
+        if framed {
+            Ok(Ok((
+                Box::new(super::framed::FramedRead::new(r)),
+                Box::new(super::framed::FramedWrite::new(w)),
+            )))
+        } else {
+            Ok(Ok((Box::new(r), Box::new(w))))
+        }
     } else {
         Ok(Err(resp))
     }

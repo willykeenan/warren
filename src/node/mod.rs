@@ -1,8 +1,11 @@
-//! The node: identity and policy files under `~/.warren` (or `WARREN_HOME`),
-//! enrollment, and the daemon that keeps the relay connection.
+//! The node: identity and policy files under `~/.warren` (on Windows
+//! `%LOCALAPPDATA%\warren`; or `WARREN_HOME`, or `--home`), enrollment, and
+//! the daemon that keeps the relay connection.
 
 pub mod control;
 pub mod daemon;
+pub mod framed;
+pub mod ipc;
 
 use crate::crypto::{self, Identity};
 use crate::fsutil;
@@ -13,18 +16,19 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Longest Unix socket path this platform accepts (`sun_path` less its
-/// terminating NUL).
+/// terminating NUL). Windows uses a named pipe whose name does not depend on
+/// the length of the home.
 pub const MAX_SOCKET_PATH: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
     107
 } else {
     103
 };
 
-/// The node home is too deep for its control socket.
+/// The node home is too deep for its control socket (Unix only).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(
     "WARREN_HOME is too long for the control socket ({path} is {len} bytes; the limit is \
@@ -46,13 +50,24 @@ impl NodePaths {
         NodePaths { home: home.into() }
     }
 
-    /// `$WARREN_HOME`, else `~/.warren`.
-    pub fn from_env() -> Result<NodePaths> {
+    /// The node home: `cli_home` (`--home`) if given, else `$WARREN_HOME`,
+    /// else the default: `~/.warren` on Unix, `%LOCALAPPDATA%\warren` on
+    /// Windows (local, not roaming, so keys never follow a roaming profile to
+    /// another machine; `HOME` is ignored there, so Git Bash, PowerShell and
+    /// cmd agree).
+    pub fn resolve(cli_home: Option<&Path>) -> Result<NodePaths> {
+        if let Some(h) = cli_home.filter(|h| !h.as_os_str().is_empty()) {
+            return Ok(NodePaths::new(h));
+        }
         if let Some(h) = std::env::var_os("WARREN_HOME").filter(|v| !v.is_empty()) {
             return Ok(NodePaths::new(PathBuf::from(h)));
         }
-        let home = std::env::var_os("HOME").context("HOME is not set; set WARREN_HOME")?;
-        Ok(NodePaths::new(PathBuf::from(home).join(".warren")))
+        Ok(NodePaths::new(default_home()?))
+    }
+
+    /// [`NodePaths::resolve`] without `--home`.
+    pub fn from_env() -> Result<NodePaths> {
+        NodePaths::resolve(None)
     }
 
     pub fn identity(&self) -> PathBuf {
@@ -70,11 +85,14 @@ impl NodePaths {
     pub fn publishes(&self) -> PathBuf {
         self.home.join("publishes.json")
     }
+    /// The control socket.
+    #[cfg(unix)]
     pub fn socket(&self) -> PathBuf {
         self.home.join("warren.sock")
     }
     /// [`NodePaths::socket`], or an error saying the home is too long for a
     /// Unix socket path.
+    #[cfg(unix)]
     pub fn checked_socket(&self) -> Result<PathBuf, SocketPathTooLong> {
         let p = self.socket();
         let len = p.as_os_str().len();
@@ -85,6 +103,13 @@ impl NodePaths {
             });
         }
         Ok(p)
+    }
+    /// Check that the daemon of this home can have a control channel: on
+    /// Unix the socket path must fit `sun_path`; Windows has no limit.
+    pub fn check_control(&self) -> Result<(), SocketPathTooLong> {
+        #[cfg(unix)]
+        self.checked_socket()?;
+        Ok(())
     }
     pub fn logs(&self) -> PathBuf {
         self.home.join("logs")
@@ -125,6 +150,7 @@ impl fmt::Debug for IdentityFile {
 
 impl IdentityFile {
     pub fn load(paths: &NodePaths) -> Result<IdentityFile> {
+        fsutil::ensure_private_file(&paths.identity())?;
         fsutil::read_json(&paths.identity())?.ok_or_else(|| {
             anyhow!(
                 "this machine is not enrolled (no {}); run `warren join CODE --relay URL`",
@@ -389,7 +415,7 @@ pub async fn join(
     }
     // A home too long for the control socket could never run `warren up`.
     paths
-        .checked_socket()
+        .check_control()
         .map_err(|e| JoinError::Usage(e.to_string()))?;
     // A running daemon loaded the current identity at start and would keep
     // authenticating with it (revoked, after a re-enrollment) forever.
@@ -492,7 +518,29 @@ where
     serde_json::from_str(t.as_str()).context("malformed relay reply")
 }
 
+/// The default node home (see [`NodePaths::resolve`]).
+#[cfg(unix)]
+pub fn default_home() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set; set WARREN_HOME")?;
+    Ok(PathBuf::from(home).join(".warren"))
+}
+
+/// The default node home (see [`NodePaths::resolve`]).
+#[cfg(windows)]
+pub fn default_home() -> Result<PathBuf> {
+    let var = |n: &str| {
+        std::env::var_os(n)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    var("LOCALAPPDATA")
+        .or_else(|| var("USERPROFILE").map(|p| p.join("AppData").join("Local")))
+        .map(|p| p.join("warren"))
+        .context("neither LOCALAPPDATA nor USERPROFILE is set; set WARREN_HOME")
+}
+
 /// Default node name: the host name, sanitized to `[a-z0-9-]{1,32}`.
+#[cfg(unix)]
 pub fn default_name() -> String {
     let raw = std::process::Command::new("uname")
         .arg("-n")
@@ -501,6 +549,12 @@ pub fn default_name() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
     sanitize_name(&raw)
+}
+
+/// Default node name: the computer name, sanitized to `[a-z0-9-]{1,32}`.
+#[cfg(windows)]
+pub fn default_name() -> String {
+    sanitize_name(&std::env::var("COMPUTERNAME").unwrap_or_default())
 }
 
 pub fn sanitize_name(raw: &str) -> String {
@@ -523,6 +577,7 @@ pub fn sanitize_name(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn control_socket_path_length() {
         let ok = NodePaths::new("/tmp/w");
@@ -628,8 +683,13 @@ mod tests {
         };
         paths.ensure().unwrap();
         fsutil::write_json(&paths.identity(), &f).unwrap();
-        assert_eq!(fsutil::mode_of(&paths.home).unwrap(), 0o700);
-        assert_eq!(fsutil::mode_of(&paths.identity()).unwrap(), 0o600);
+        #[cfg(unix)]
+        {
+            assert_eq!(fsutil::mode_of(&paths.home).unwrap(), 0o700);
+            assert_eq!(fsutil::mode_of(&paths.identity()).unwrap(), 0o600);
+        }
+        assert!(fsutil::is_private(&paths.home).unwrap());
+        assert!(fsutil::is_private(&paths.identity()).unwrap());
         let back = IdentityFile::load(&paths).unwrap();
         assert_eq!(back.identity().unwrap().static_pub, id.static_pub);
         let dbg = format!("{back:?}");
@@ -638,8 +698,20 @@ mod tests {
     }
 
     #[test]
+    fn home_resolution() {
+        let t = tempfile::tempdir().unwrap();
+        let explicit = t.path().join("explicit");
+        assert_eq!(NodePaths::resolve(Some(&explicit)).unwrap().home, explicit);
+        // An empty --home is ignored like an empty WARREN_HOME.
+        let empty = PathBuf::new();
+        let fallback = NodePaths::resolve(Some(&empty)).unwrap();
+        assert_eq!(fallback.home, NodePaths::from_env().unwrap().home);
+    }
+
+    #[test]
     fn names() {
         assert_eq!(sanitize_name("My-MacBook.local\n"), "my-macbook");
+        assert_eq!(sanitize_name("DESKTOP-4F2K9QL"), "desktop-4f2k9ql");
         assert_eq!(sanitize_name("___"), "node");
         assert_eq!(sanitize_name(&"x".repeat(50)).len(), 32);
         assert!(crate::valid_name(&default_name()));

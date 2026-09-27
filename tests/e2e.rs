@@ -45,10 +45,18 @@ async fn join_share_forward_and_nc() {
     }
 
     // nc: the control socket becomes a pipe.
-    let (mut r, mut w) = warren::node::control::open(&a.paths, "b", echo)
+    let (mut r, mut w) = warren::node::control::open_with_framing(&a.paths, "b", echo, true)
         .await
         .unwrap()
         .unwrap();
+    w.write_all(b"interactive").await.unwrap();
+    w.flush().await.unwrap();
+    let mut interactive = [0; 11];
+    tokio::time::timeout(Duration::from_secs(10), r.read_exact(&mut interactive))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&interactive, b"interactive");
     w.write_all(b"hello over nc\n").await.unwrap();
     w.shutdown().await.unwrap();
     let mut got = Vec::new();
@@ -1328,28 +1336,20 @@ async fn json_outputs_have_no_secrets() {
         assert!(!st.contains(s.as_str()) && !dev.contains(s.as_str()));
         assert!(!st.contains(&s[..16]) && !dev.contains(&s[..16]));
     }
-    assert_eq!(warren::fsutil::mode_of(&a.paths.home).unwrap(), 0o700);
+    assert!(warren::fsutil::is_private(&a.paths.home).unwrap());
     for f in ["identity.json", "known_peers.json"] {
-        assert_eq!(
-            warren::fsutil::mode_of(&a.paths.home.join(f)).unwrap(),
-            0o600,
+        assert!(
+            warren::fsutil::is_private(&a.paths.home.join(f)).unwrap(),
             "{f}"
         );
     }
-    assert_eq!(
-        warren::fsutil::mode_of(&a.paths.socket()).unwrap() & 0o077,
-        0
-    );
-    assert_eq!(warren::fsutil::mode_of(&relay.state_dir()).unwrap(), 0o700);
+    #[cfg(unix)]
+    assert!(warren::fsutil::is_private(&a.paths.socket()).unwrap());
+    assert!(warren::fsutil::is_private(&relay.state_dir()).unwrap());
     for e in std::fs::read_dir(relay.state_dir()).unwrap() {
         let p = e.unwrap().path();
         if p.is_file() {
-            assert_eq!(
-                warren::fsutil::mode_of(&p).unwrap() & 0o077,
-                0,
-                "{}",
-                p.display()
-            );
+            assert!(warren::fsutil::is_private(&p).unwrap(), "{}", p.display());
         }
     }
 }

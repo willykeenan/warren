@@ -16,3 +16,14 @@ them is described in the README.
 | SR9 | The binary connects only to its relay, to loopback ports and, on the relay, to its ACME directory. | `tests/network_audit.rs`, `tests/cli.rs` |
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).
+
+## Windows candidate boundary
+
+Windows uses a protected user + SYSTEM DACL and a local named pipe in place of
+Unix file modes and sockets. The client verifies pipe ownership; the server
+rejects remote clients and requires the first instance. The only source module
+permitted to contain unsafe code is `src/sys/windows.rs`, containing documented
+Win32 calls and owned allocation/handle guards. All security policy and framing
+logic is safe Rust and tested on the native host. This is a deliberate exception
+to the earlier crate-wide unsafe ban and needs independent security review.
+Windows kernel behavior and cross-account rejection still require Windows proof.

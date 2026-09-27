@@ -24,6 +24,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Strip `#[cfg(test)] mod tests { ... }` blocks: tests may open sockets freely.
 fn non_test_source(src: &str) -> String {
+    let src = src.replace("\r\n", "\n");
     match src.find("#[cfg(test)]\nmod tests") {
         Some(i) => src[..i].to_string(),
         None => src.to_string(),
@@ -49,16 +50,18 @@ fn outbound_connections_only_in_the_dial_module() {
         ("client_async", &["src/ws.rs"]),
         ("net::dial_relay", &["src/ws.rs"]),
         ("instant_acme", &["src/relay/acme.rs"]),
-        (
-            "UnixStream::connect",
-            &["src/node/control.rs", "src/node/daemon.rs"],
-        ),
+        ("UnixStream::connect", &["src/node/ipc.rs"]),
         ("reqwest", &[]),
         ("ureq", &[]),
         ("hyper", &[]),
         (
             "Command::new",
-            &["src/install.rs", "src/cli.rs", "src/node/mod.rs"],
+            &[
+                "src/install.rs",
+                "src/install_windows.rs",
+                "src/cli.rs",
+                "src/node/mod.rs",
+            ],
         ),
     ];
     let mut violations = Vec::new();
@@ -106,20 +109,21 @@ fn outbound_connections_only_in_the_dial_module() {
 fn no_network_client_dependencies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    let deps = manifest
-        .split("[dependencies]")
-        .nth(1)
-        .unwrap()
-        .split("\n[")
-        .next()
-        .unwrap();
-    let names: Vec<&str> = deps
-        .lines()
-        .filter_map(|l| l.split('=').next())
-        .map(str::trim)
-        .filter(|n| !n.is_empty() && !n.starts_with('#'))
-        .collect();
+    let mut in_deps = false;
+    let mut names = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_deps = line == "[dependencies]"
+                || (line.starts_with("[target.") && line.ends_with(".dependencies]"));
+        } else if in_deps && !line.starts_with('#') {
+            if let Some((name, _)) = line.split_once('=') {
+                names.push(name.trim());
+            }
+        }
+    }
     let allowed = [
+        "windows-sys", // Restricted Win32 ACL, pipe security and console wrapper.
         "anyhow",
         "bytes",
         "clap",
@@ -152,4 +156,35 @@ fn no_network_client_dependencies() {
         assert!(allowed.contains(n), "unreviewed dependency {n}");
     }
     assert!(names.len() >= 20);
+}
+
+#[test]
+fn windows_security_boundaries_are_explicit() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ipc = std::fs::read_to_string(root.join("src/node/ipc.rs")).unwrap();
+    for guard in [
+        "first_pipe_instance(true)",
+        "reject_remote_clients(true)",
+        "SECURITY_IDENTIFICATION",
+        "owner_sid",
+    ] {
+        assert!(ipc.contains(guard), "missing {guard}");
+    }
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    for f in files {
+        if f.ends_with("sys/windows.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&f).unwrap();
+        for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            for forbidden in ["unsafe {", "unsafe fn", "unsafe impl", "allow(unsafe_code)"] {
+                assert!(
+                    !line.contains(forbidden),
+                    "unsafe outside wrapper: {}: {line}",
+                    f.display()
+                );
+            }
+        }
+    }
 }

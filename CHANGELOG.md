@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 semantic versioning.
 
+## Unreleased
+
+- Windows source candidate: private ACLs, local named-pipe control with framed
+  half-close, per-user logon task, console signals, and OpenSSH argument handling.
+- Windows x64 CI and tag-only ZIP build definitions. Windows execution and ARM64
+  qualification remain pending; this entry does not describe a released build.
+- Portable framing and SDDL tests; Windows ACL and pipe-instance tests.
+
 ## [0.1.0] - 2026-09-27
 
 First release. See *Status and limitations* in the README for what has and

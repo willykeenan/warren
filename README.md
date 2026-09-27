@@ -30,6 +30,68 @@ also publish one local service on a public HTTPS name.
   Public traffic is, by necessity, TLS-terminated at the relay: the relay sees
   published traffic in plaintext. Private links never are.
 
+## Windows (candidate)
+
+Windows support is a source candidate. Windows compilation, runtime tests and
+installer acceptance have **not** been run for this candidate. The checked-in
+CI jobs describe the required validation; they are not a passing CI receipt.
+
+Target: Windows 10/11 x64, Rust 1.88+ and Visual Studio C++ Build Tools for a
+source build (`cargo build --release --locked`). Copy `target/release/warren.exe`
+to a stable folder on PATH. The tag-only workflow can produce an x64 ZIP once
+Windows CI passes; no Windows binary is published by this change. ARM64 is not
+yet qualified. Unsigned binaries may trigger SmartScreen.
+
+In PowerShell, enroll and run the node (replace the example relay/code):
+
+```powershell
+warren join CODE --relay https://relay.example.com --name desktop
+warren up
+# In a second terminal:
+warren status
+warren share 22 --to laptop
+warren install
+warren down
+warren uninstall
+```
+
+The default home is `%LOCALAPPDATA%\warren` (fallback:
+`%USERPROFILE%\AppData\Local\warren`). `--home DIR` overrides `WARREN_HOME`.
+PowerShell, cmd and Git Bash use the same default; `HOME` is ignored on Windows.
+Use a dedicated local NTFS/ReFS directory. Files and directories use a protected
+DACL granting your account and SYSTEM access. Administrators can take ownership.
+FAT/exFAT cannot enforce this privacy and are rejected.
+
+The control endpoint is a local named pipe derived from your SID and canonical
+home. It rejects remote clients, authenticates the owner before sending requests,
+and reserves the first instance. Framing preserves `nc` half-close semantics.
+Windows allows at most 254 connected control clients plus the listening instance.
+
+`install` registers a least-privilege, current-user logon task with no password or
+administrator requirement, and checks that the daemon becomes reachable. The
+console may appear briefly; background logs go to `logs\warren.log` without ANSI
+colors. `down` exits cleanly and stays down until the next logon or explicit start.
+`install --no-start` registers for the next logon; `--dir DIR` or `WARREN_TASK_DIR`
+writes UTF-16 task XML only, with no Task Scheduler effects. `uninstall` removes
+the task and XML, preserving enrollment and settings. A failed deletion is an
+error; if someone manually removes a registered task, remove the stale XML only
+after confirming that task is absent.
+
+Install the Windows OpenSSH Client optional feature for `warren ssh me@desktop`.
+An equivalent SSH config uses:
+
+```sshconfig
+Host desktop
+    ProxyCommand "C:/tools/warren.exe" nc %h 22
+```
+
+Paths with spaces are quoted. Paths containing quotes, `%`, `$`, backticks or
+control characters are rejected for SSH. Real Windows OpenSSH is a CI test;
+Git for Windows/MSYS OpenSSH still needs a separate compatibility run. Firewall,
+reserved-port, user-logon, console-close and desktop acceptance remain Windows
+validation requirements. The relay is not qualified for Windows production; use
+Linux for relay hosting until its platform-specific checks pass.
+
 ## Quick start (about five minutes)
 
 You need a small server with a public IP (the relay) and two machines. The
@@ -164,7 +226,7 @@ warren is new. Read this before relying on it.
 | `warren relay nodes` / `revoke NAME` / `domain add HOST NAME` / `info` | relay administration |
 | `warren join CODE --relay URL [--name N]` | enroll this machine (generates its keys) |
 | `warren up` | run the node daemon in the foreground |
-| `warren install` / `uninstall` | start `warren up` at login (launchd on macOS, systemd user unit on Linux) |
+| `warren install` / `uninstall` | start `warren up` at login (launchd on macOS, systemd user unit on Linux, per-user Task Scheduler on Windows) |
 | `warren down` | stop the running daemon (a daemon started by `warren install` then stays stopped until the next login or `warren install`) |
 | `warren status` | relay, connection state, latency, shares, forwards, publishes, recent errors |
 | `warren share PORT [--to a,b]` / `unshare PORT` | allow (some) enrolled machines to reach `127.0.0.1:PORT` |
@@ -181,7 +243,7 @@ including argument errors, are then a JSON object `{"ok": false, "code":
 ..., "error": ...}` on stdout. Shares, forwards and publishes persist across
 restarts.
 
-Nodes run on macOS and Linux. On Linux, systemd user services run only while
+Nodes run on macOS and Linux; see the Windows candidate status above. On Linux, systemd user services run only while
 you are logged in; on a headless machine run `loginctl enable-linger $USER`
 once so `warren up` starts at boot.
 
@@ -216,7 +278,7 @@ directory is `0700` and every file in it `0600`:
 
 Use a dedicated directory for `WARREN_HOME` (and for the relay's `--state`):
 warren sets it to `0700`, and warns when that takes access away from others.
-Keep the path short: the control socket inside it must fit in a Unix socket
+On Unix, keep the path short: the control socket inside it must fit in a Unix socket
 path (103 bytes on macOS, 107 on Linux), and warren says so when it does not.
 
 On Linux the login service logs to the user journal: `journalctl --user -u

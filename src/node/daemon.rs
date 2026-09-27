@@ -3,6 +3,7 @@
 //! private streams, forwards, publishes and the local control socket.
 
 use super::control::{self, ControlRequest, ControlResponse};
+use super::ipc;
 use super::{
     Forward, ForwardsFile, IdentityFile, KnownPeers, NodePaths, PinCheck, Publish, PublishesFile,
     ShareDecision, SharesFile,
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -332,7 +333,7 @@ impl DaemonHandle {
         for t in self.tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
         }
-        let _ = std::fs::remove_file(self.inner.cfg.paths.socket());
+        ipc::cleanup(&self.inner.cfg.paths);
     }
 
     /// Wait until connected to the relay.
@@ -357,6 +358,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
     let paths = cfg.paths.clone();
     paths.ensure()?;
+    crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
     let id = ident.identity()?;
     let relay = ident.relay_url()?;
@@ -384,7 +386,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         shutdown: CancellationToken::new(),
     });
 
-    let listener = bind_control(&paths).await?;
+    let listener = ipc::bind(&paths).await?;
     let mut tasks = Vec::new();
     {
         let d = inner.clone();
@@ -412,20 +414,6 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     }
     tracing::info!(node = %inner.ident.name, relay = %inner.relay.https(), open_files, "warren node started");
     Ok(DaemonHandle { inner, tasks })
-}
-
-async fn bind_control(paths: &NodePaths) -> Result<UnixListener> {
-    let sock = paths.checked_socket()?;
-    if sock.exists() {
-        if UnixStream::connect(&sock).await.is_ok() {
-            anyhow::bail!("warren is already running for {}", paths.home.display());
-        }
-        let _ = std::fs::remove_file(&sock);
-    }
-    let l = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
 }
 
 impl DaemonInner {
@@ -1381,9 +1369,9 @@ impl DaemonInner {
         }
     }
 
-    async fn serve_control(self: Arc<Self>, l: UnixListener) {
+    async fn serve_control(self: Arc<Self>, mut l: ipc::Listener) {
         loop {
-            let (s, _) = tokio::select! {
+            let s = tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 r = l.accept() => match crate::net::accepted(r, "control socket").await {
                     Some(x) => x,
@@ -1393,11 +1381,11 @@ impl DaemonInner {
             let d = self.clone();
             tokio::spawn(async move { d.control_conn(s).await });
         }
-        let _ = std::fs::remove_file(self.cfg.paths.socket());
+        ipc::cleanup(&self.cfg.paths);
     }
 
-    async fn control_conn(self: Arc<Self>, s: UnixStream) {
-        let (r, mut w) = s.into_split();
+    async fn control_conn(self: Arc<Self>, s: ipc::Server) {
+        let (r, mut w) = tokio::io::split(s);
         let mut r = tokio::io::BufReader::new(r);
         let line =
             match tokio::time::timeout(Duration::from_secs(10), control::read_line(&mut r)).await {
@@ -1415,7 +1403,7 @@ impl DaemonInner {
                 return;
             }
         };
-        if let ControlRequest::Open { node, port } = req {
+        if let ControlRequest::Open { node, port, framed } = req {
             match self.open_private(&node, port).await {
                 Ok(chan) => {
                     if write_resp(
@@ -1427,7 +1415,16 @@ impl DaemonInner {
                     {
                         return;
                     }
-                    let _ = chan.pipe(r, w).await;
+                    if framed {
+                        let _ = chan
+                            .pipe(
+                                super::framed::FramedRead::new(r),
+                                super::framed::FramedWrite::new(w),
+                            )
+                            .await;
+                    } else {
+                        let _ = chan.pipe(r, w).await;
+                    }
                 }
                 Err(e) => {
                     let _ =
@@ -1484,22 +1481,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let h = start(cfg).await?;
     let token = h.inner.shutdown.clone();
     tokio::spawn(async move {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-            _ = token.cancelled() => {}
-        }
+        let Ok(signal) = crate::sys::shutdown_signal() else {
+            return;
+        };
+        tokio::select! { _ = signal => {}, _ = token.cancelled() => {} }
         token.cancel();
     });
     let paths = h.inner.cfg.paths.clone();
     h.inner.shutdown.cancelled().await;
     h.wait().await;
-    let _ = std::fs::remove_file(paths.socket());
+    ipc::cleanup(&paths);
     tracing::info!("warren node stopped");
     Ok(())
 }

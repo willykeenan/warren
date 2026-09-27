@@ -717,6 +717,7 @@ where
     while let Some(b) = rx.recv().await? {
         total += b.len() as u64;
         w.write_all(&b).await?;
+        w.flush().await?;
     }
     let _ = w.shutdown().await;
     Ok(total)

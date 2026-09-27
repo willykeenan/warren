@@ -47,6 +47,7 @@ async fn join_force_refuses_while_the_daemon_runs() {
 
 /// A WARREN_HOME too long for a Unix socket path is refused with an
 /// explanation, by the daemon and by the CLI's control requests.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn too_long_home_is_explained() {
     let relay = start_relay().await;
