@@ -497,7 +497,7 @@ impl NodeLink {
 
 /// Public URL of a published name.
 pub fn public_url(inner: &RelayInner, name: &str) -> String {
-    let port = inner.cfg.listen.port();
+    let port = inner.addr.port();
     if port == 443 || port == 0 {
         format!("https://{name}.{}/", inner.cfg.publish_domain)
     } else {
@@ -698,6 +698,10 @@ pub async fn serve_node(
     {
         old.out.close();
     }
+    let cleanup = LinkCleanup {
+        inner: inner.clone(),
+        link: link.clone(),
+    };
     let _ = inner.db.touch_last_seen(&record.node_id, crate::now_secs());
     tracing::info!(node = %record.name, %peer, "node connected");
 
@@ -744,19 +748,35 @@ pub async fn serve_node(
         }
     };
     tracing::info!(node = %link.name, reason, "node disconnected");
-    out.close();
-    {
-        let mut online = inner.online.lock().unwrap();
-        if online
-            .get(&link.node_id)
-            .is_some_and(|l| l.conn_id == link.conn_id)
-        {
-            online.remove(&link.node_id);
-        }
-    }
-    link.teardown();
-    let _ = inner.db.touch_last_seen(&link.node_id, crate::now_secs());
+    drop(cleanup);
     let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
+}
+
+/// Tears a link down however `serve_node` ends, including when its future is
+/// dropped during relay shutdown.
+struct LinkCleanup {
+    inner: Arc<RelayInner>,
+    link: Arc<NodeLink>,
+}
+
+impl Drop for LinkCleanup {
+    fn drop(&mut self) {
+        self.link.out.close();
+        {
+            let mut online = self.inner.online.lock().unwrap();
+            if online
+                .get(&self.link.node_id)
+                .is_some_and(|l| l.conn_id == self.link.conn_id)
+            {
+                online.remove(&self.link.node_id);
+            }
+        }
+        self.link.teardown();
+        let _ = self
+            .inner
+            .db
+            .touch_last_seen(&self.link.node_id, crate::now_secs());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

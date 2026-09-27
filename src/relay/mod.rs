@@ -88,6 +88,8 @@ pub struct Registry {
 /// Shared relay state.
 pub struct RelayInner {
     pub cfg: RelayConfig,
+    /// The address actually bound (differs from `cfg.listen` for port 0).
+    pub addr: SocketAddr,
     pub db: Db,
     pub resolver: Arc<CertResolver>,
     acceptor: TlsAcceptor,
@@ -284,6 +286,7 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
     let http_addr = http_listener.as_ref().and_then(|l| l.local_addr().ok());
     let inner = Arc::new(RelayInner {
         cfg: cfg.clone(),
+        addr,
         db,
         resolver,
         acceptor,
@@ -375,10 +378,33 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
     })
 }
 
-async fn write_and_close<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) {
+/// Send a final response, close our side, then briefly drain what the client
+/// is still sending so the close does not turn into a reset that destroys the
+/// response before the client reads it.
+pub(crate) async fn write_and_close<S>(s: &mut S, bytes: &[u8])
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = w.write_all(bytes).await;
-        let _ = w.shutdown().await;
+        let _ = s.write_all(bytes).await;
+        let _ = s.shutdown().await;
+    })
+    .await;
+    drain(s).await;
+}
+
+/// Read and discard input for a short time (bounded in time and bytes).
+pub(crate) async fn drain<R: tokio::io::AsyncRead + Unpin>(r: &mut R) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut total = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while total < 1024 * 1024 {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
     })
     .await;
 }

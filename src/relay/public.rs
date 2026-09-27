@@ -199,11 +199,32 @@ pub async fn serve(
                     break;
                 }
             }
-            _ = &mut responses => {
+            rejected = &mut responses => {
+                if rejected && !req_done {
+                    // Let the request side drain what the client is still
+                    // sending so closing does not reset the connection
+                    // before the client has read the rejection.
+                    let _ = tokio::time::timeout(Duration::from_millis(1500), &mut requests).await;
+                }
                 break;
             }
         }
     }
+}
+
+/// Queue a relay-generated rejection, stop the upstream side and drain the
+/// client briefly (bounded) so the rejection is not lost to a reset.
+async fn reject(
+    info: &mpsc::UnboundedSender<ReqInfo>,
+    response: Vec<u8>,
+    client: &mut BufConn<ReadHalf<ServerTls>>,
+    tx: &MuxSender,
+) -> Result<(), HttpError> {
+    let _ = info.send(ReqInfo::Reject(response));
+    tx.finish();
+    client.buf.clear();
+    super::drain(&mut client.inner).await;
+    Ok(())
 }
 
 /// Parse requests from the client, rewrite their heads and stream them upstream.
@@ -220,24 +241,29 @@ async fn request_side(
     let mut req = first;
     loop {
         if req.host().as_deref().is_some_and(|h| h != host) {
-            let _ = info.send(ReqInfo::Reject(simple_response(
-                421,
-                "Misdirected Request",
-                "Host changed on this connection\n",
-                true,
-            )));
-            return Ok(());
+            return reject(
+                &info,
+                simple_response(
+                    421,
+                    "Misdirected Request",
+                    "Host changed on this connection\n",
+                    true,
+                ),
+                client,
+                tx,
+            )
+            .await;
         }
         let kind = match req.body_kind() {
             Ok(k) => k,
             Err(_) => {
-                let _ = info.send(ReqInfo::Reject(simple_response(
-                    400,
-                    "Bad Request",
-                    "bad request\n",
-                    true,
-                )));
-                return Ok(());
+                return reject(
+                    &info,
+                    simple_response(400, "Bad Request", "bad request\n", true),
+                    client,
+                    tx,
+                )
+                .await;
             }
         };
         let upgrade = req.is_upgrade();
@@ -294,22 +320,27 @@ async fn request_side(
                 return Ok(());
             }
             Ok(Err(HttpError::TooLarge)) => {
-                let _ = info.send(ReqInfo::Reject(simple_response(
-                    431,
-                    "Request Header Fields Too Large",
-                    "request header too large\n",
-                    true,
-                )));
-                return Ok(());
+                return reject(
+                    &info,
+                    simple_response(
+                        431,
+                        "Request Header Fields Too Large",
+                        "request header too large\n",
+                        true,
+                    ),
+                    client,
+                    tx,
+                )
+                .await;
             }
             Ok(Err(_)) => {
-                let _ = info.send(ReqInfo::Reject(simple_response(
-                    400,
-                    "Bad Request",
-                    "bad request\n",
-                    true,
-                )));
-                return Ok(());
+                return reject(
+                    &info,
+                    simple_response(400, "Bad Request", "bad request\n", true),
+                    client,
+                    tx,
+                )
+                .await;
             }
         };
     }
@@ -320,12 +351,14 @@ async fn response_side(
     mut upstream: BufConn<MuxReceiver>,
     w: WriteHalf<ServerTls>,
     mut info: mpsc::UnboundedReceiver<ReqInfo>,
-) {
+) -> bool {
     let mut sink = WriteSink(w);
+    let mut rejected = false;
     let _ = async {
         while let Some(i) = info.recv().await {
             match i {
                 ReqInfo::Reject(bytes) => {
+                    rejected = true;
                     sink.put(bytes.into()).await?;
                     return Ok::<(), HttpError>(());
                 }
@@ -379,4 +412,5 @@ async fn response_side(
     }
     .await;
     let _ = tokio::time::timeout(Duration::from_secs(5), sink.0.shutdown()).await;
+    rejected
 }
