@@ -643,9 +643,7 @@ async fn binary_end_to_end() {
         assert!(private(&h), "{home}");
         for f in std::fs::read_dir(&h).unwrap() {
             let p = f.unwrap().path();
-            if p.is_file() {
-                assert!(private(&p), "{}", p.display());
-            } else if p.is_dir() {
+            if p.is_file() || p.is_dir() {
                 assert!(private(&p), "{}", p.display());
             }
         }
