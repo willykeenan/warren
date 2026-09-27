@@ -15,6 +15,13 @@
 //! | 8 | authentication or enrollment refused |
 //! | 9 | name conflict (publish) |
 
+// Doc comments below double as `--help` text, which is plain text, not rustdoc.
+#![allow(
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links
+)]
+
 use crate::install::{self, Flavor, InstallOptions};
 use crate::node::control::{self, ControlError, ControlRequest, ControlResponse};
 use crate::node::daemon::{self, DaemonConfig};
