@@ -96,6 +96,12 @@ mod windows {
                     if win::owner_sid(&s, win::Object::Kernel)? != win::current_user_sid()? {
                         return Err(ControlError::Untrusted);
                     }
+                    if !sddl::trusted_pipe_integrity(
+                        &win::integrity_sddl(&s, win::Object::Kernel)?,
+                        &win::current_integrity_sid()?,
+                    ) {
+                        return Err(ControlError::Untrusted);
+                    }
                     return Ok(s);
                 }
                 Err(e)
@@ -113,8 +119,15 @@ mod windows {
     }
     pub async fn bind(paths: &NodePaths) -> anyhow::Result<Listener> {
         let name = pipe_name(paths)?;
-        let sd =
-            win::SecurityDescriptor::from_sddl(&sddl::control_pipe(&win::current_user_sid()?))?;
+        let integrity = win::current_integrity_sid()?;
+        anyhow::ensure!(
+            sddl::integrity_level(&integrity).is_some_and(|l| l >= 8192),
+            "warren requires medium or higher integrity"
+        );
+        let sd = win::SecurityDescriptor::from_sddl(&sddl::control_pipe_at_integrity(
+            &win::current_user_sid()?,
+            &integrity,
+        ))?;
         let next = win::create_pipe(
             ServerOptions::new()
                 .first_pipe_instance(true)

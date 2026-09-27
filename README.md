@@ -61,9 +61,12 @@ PowerShell, cmd and Git Bash use the same default; `HOME` is ignored on Windows.
 Use a dedicated local NTFS/ReFS directory. Files and directories use a protected
 DACL granting your account and SYSTEM access. Administrators can take ownership.
 FAT/exFAT cannot enforce this privacy and are rejected.
+The correction candidate also rejects UNC/device paths, reparse points or
+junctions in the path, alternate data streams, and hard-linked state files.
+Policy files with unsafe ACLs are preserved and rejected for explicit recovery.
 
 The control endpoint is a local named pipe derived from your SID and canonical
-home. It rejects remote clients, authenticates the owner before sending requests,
+home. It rejects remote clients, checks the owner and mandatory integrity label before sending requests,
 and reserves the first instance. Framing preserves `nc` half-close semantics.
 Windows allows at most 254 connected control clients plus the listening instance.
 
@@ -72,10 +75,14 @@ administrator requirement, and checks that the daemon becomes reachable. The
 console may appear briefly; background logs go to `logs\warren.log` without ANSI
 colors. `down` exits cleanly and stays down until the next logon or explicit start.
 `install --no-start` registers for the next logon; `--dir DIR` or `WARREN_TASK_DIR`
-writes UTF-16 task XML only, with no Task Scheduler effects. `uninstall` removes
-the task and XML, preserving enrollment and settings. A failed deletion is an
+writes UTF-16 task XML and its name record, with no Task Scheduler effects. `uninstall` removes
+the task, XML and name record, preserving enrollment and settings. A failed deletion is an
 error; if someone manually removes a registered task, remove the stale XML only
 after confirming that task is absent.
+The registered task name is saved in `login-task-name.json` so alternate spellings
+of the home remove the same registration. Older candidates with XML but no name
+record require manual removal of the old `warren-*` task and its XML before
+reinstalling; the installer refuses to guess an old task name.
 
 Install the Windows OpenSSH Client optional feature for `warren ssh me@desktop`.
 An equivalent SSH config uses:

@@ -26,7 +26,48 @@ pub fn private_file(user_sid: &str) -> String {
 /// LocalSystem may connect or create instances, and network logons are
 /// denied as a second line of defence (the pipe also rejects remote clients).
 pub fn control_pipe(user_sid: &str) -> String {
-    format!("O:{user_sid}D:P(D;;FA;;;NU)(A;;FA;;;{user_sid})(A;;FA;;;SY)")
+    control_pipe_at_integrity(user_sid, "ME")
+}
+
+pub fn control_pipe_at_integrity(user_sid: &str, integrity_sid: &str) -> String {
+    format!(
+        "O:{user_sid}D:P(D;;FA;;;NU)(A;;FA;;;{user_sid})(A;;FA;;;SY)S:(ML;;NW;;;{integrity_sid})"
+    )
+}
+
+/// Mandatory integrity SID or its SDDL alias. Unknown labels fail closed.
+pub fn integrity_level(sid: &str) -> Option<u32> {
+    match sid {
+        "LW" => Some(4096),
+        "ME" => Some(8192),
+        "MP" => Some(8448),
+        "HI" => Some(12288),
+        "SI" => Some(16384),
+        _ => sid.strip_prefix("S-1-16-")?.parse().ok(),
+    }
+}
+
+/// The connected object must carry one explicit no-write-up label at medium
+/// or above and at least the caller's integrity. Missing labels are rejected.
+pub fn trusted_pipe_integrity(text: &str, caller_sid: &str) -> bool {
+    let Some(caller) = integrity_level(caller_sid) else {
+        return false;
+    };
+    let Ok(parts) = components(text) else {
+        return false;
+    };
+    let labels: Vec<_> = parts.iter().filter(|(k, _)| *k == 'S').collect();
+    if labels.len() != 1 {
+        return false;
+    }
+    let Ok(Dacl::List { aces, .. }) = parse_dacl(labels[0].1) else {
+        return false;
+    };
+    aces.len() == 1
+        && aces[0].kind == "ML"
+        && aces[0].flags.is_empty()
+        && (aces[0].rights.contains("NW") || aces[0].rights == "0x1")
+        && integrity_level(&aces[0].sid).is_some_and(|level| level >= caller.max(8192))
 }
 
 /// A security descriptor's owner and DACL.
@@ -394,6 +435,25 @@ mod tests {
     use super::*;
 
     const ME: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    #[test]
+    fn pipe_integrity_requires_an_explicit_sufficient_label() {
+        assert!(trusted_pipe_integrity("S:(ML;;NW;;;ME)", "S-1-16-8192"));
+        assert!(trusted_pipe_integrity("S:(ML;;NW;;;HI)", "S-1-16-8192"));
+        for bad in [
+            "",
+            "D:P(A;;FA;;;SY)",
+            "S:(ML;;NW;;;LW)",
+            "S:(ML;;NW;;;S-1-16-0)",
+            "S:(ML;;NR;;;ME)",
+            "S:(ML;IO;NW;;;ME)",
+            "S:(ML;;NW;;;ME)(ML;;NW;;;LW)",
+        ] {
+            assert!(!trusted_pipe_integrity(bad, "S-1-16-8192"), "{bad}");
+        }
+        assert!(!trusted_pipe_integrity("S:(ML;;NW;;;ME)", "S-1-16-12288"));
+        assert!(!trusted_pipe_integrity("S:(ML;;NW;;;HI)", "unknown"));
+    }
 
     #[test]
     fn warren_descriptors_are_private() {

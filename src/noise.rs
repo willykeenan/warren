@@ -378,8 +378,11 @@ impl SecureReceiver {
         while let Some(p) = self.recv().await? {
             total += p.len() as u64;
             w.write_all(&p).await?;
+            // Framed control output buffers a payload until flushed. Deliver it
+            // before awaiting the peer again (SSH banners must not need EOF).
+            w.flush().await?;
         }
-        let _ = w.shutdown().await;
+        w.shutdown().await?;
         // Wait for the peer's FIN (bounded) so the stream is fully closed.
         let _ = tokio::time::timeout(Duration::from_secs(5), self.rx.recv()).await;
         Ok(total)

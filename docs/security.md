@@ -27,3 +27,33 @@ Win32 calls and owned allocation/handle guards. All security policy and framing
 logic is safe Rust and tested on the native host. This is a deliberate exception
 to the earlier crate-wide unsafe ban and needs independent security review.
 Windows kernel behavior and cross-account rejection still require Windows proof.
+
+The correction candidate validates identity and policy bytes through the same
+open handle used for reading. A policy file with unsafe ownership or outsider
+access is rejected and preserved for explicit recovery; it is not automatically
+made trustworthy by changing its ACL. A private file missing inheritance
+protection is protected and rechecked on that handle. Ancestor handles deny
+write/delete sharing during access. Local drive paths are the supported scope;
+UNC/device paths, reparse points (including junction ancestors), alternate data
+streams and hard-linked state files are rejected. Previously retained data-write
+handles cause opening the private reader to fail rather than allowing an
+unchecked concurrent writer. An account already able to run arbitrary code at
+the daemon's integrity level, and administrators/SYSTEM, remain outside this
+local isolation boundary.
+
+New private files use unpredictable exclusive names, a private descriptor at
+creation and replacement through the retained source handle. Background logs
+retain their validated append handle and ancestor pins for their lifetime.
+Pipe clients check an explicit mandatory no-write-up label before sending any
+request, requiring medium integrity or higher and at least the caller's level,
+in addition to exact owner SID and identification-only impersonation QoS. A
+low-integrity same-account counterfeit pipe is therefore intended to be refused;
+the cross-integrity Windows attack test remains mandatory before acceptance.
+
+Required Windows checks include `cargo clippy --all-targets --locked`,
+`cargo test --locked`, MSRV 1.88 all-target compilation, the ACL/alias/retained
+handle regression tests, another-account and low-integrity counterfeit pipes,
+real OpenSSH/binary half-close, and disposable Task Scheduler registration,
+abnormal restart, clean down, alias-path uninstall and logon behavior. Portable
+tests and a Windows Rust module compile do not establish any of those runtime
+results.

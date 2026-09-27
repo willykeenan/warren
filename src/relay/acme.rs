@@ -92,6 +92,7 @@ impl AcmeManager {
                 continue;
             };
             let (c, k) = self.paths(&host);
+            #[cfg(unix)]
             fsutil::ensure_private_file(&k)?;
             match crate::tls::load_cert_files(&c, &k) {
                 Ok(ck) => {
@@ -151,6 +152,7 @@ impl AcmeManager {
     async fn account(&self) -> Result<instant_acme::Account> {
         use instant_acme::{Account, AccountCredentials, NewAccount};
         let cred_path = self.dir.join("account.json");
+        #[cfg(unix)]
         fsutil::ensure_private_file(&cred_path)?;
         if let Some(creds) = fsutil::read_json::<AccountCredentials>(&cred_path)? {
             return Ok(Account::builder()?.from_credentials(creds).await?);

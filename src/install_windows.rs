@@ -31,14 +31,43 @@ pub struct InstallReport {
     pub started: bool,
     pub commands: Vec<String>,
 }
-pub fn label(opts: &InstallOptions) -> String {
-    // Home is absolute and per-user in normal use. A suffix prevents one user's
-    // default task from colliding with another user's task in the global folder.
-    format!(
-        "warren-{}",
-        &crate::crypto::sha256_hex(opts.warren_home.to_string_lossy().as_bytes())[..16]
-    )
+pub fn label(opts: &InstallOptions) -> Result<String> {
+    let home = std::fs::canonicalize(&opts.warren_home)
+        .context("resolving Task Scheduler home identity")?;
+    let mut key = current_sid()?.into_bytes();
+    key.push(0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in home.as_os_str().encode_wide() {
+            key.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        key.extend_from_slice(home.as_os_str().as_bytes());
+    }
+    Ok(format!("warren-{}", &crate::crypto::sha256_hex(&key)[..16]))
 }
+
+fn registration_label(opts: &InstallOptions, dir: &Path) -> Result<String> {
+    if let Some(label) = crate::fsutil::read_json::<String>(&dir.join("login-task-name.json"))? {
+        anyhow::ensure!(
+            label.starts_with("warren-")
+                && label.len() == 23
+                && label[7..].bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid saved task name"
+        );
+        return Ok(label);
+    }
+    // Old candidates did not save their actual task name. Do not guess an
+    // alias and create duplicates or delete an unrelated registration.
+    anyhow::ensure!(!dir.join("login-task.xml").exists(),
+        "legacy task registration has no saved task name; remove the old warren task in Task Scheduler and its login-task.xml before reinstalling");
+    label(opts)
+}
+
 pub fn default_dir(_: Flavor) -> Result<PathBuf> {
     crate::node::default_home()
 }
@@ -85,7 +114,7 @@ pub fn task_xml(opts: &InstallOptions, sid: &str) -> Vec<u8> {
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
 <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>{args}</Arguments><WorkingDirectory>{home}</WorkingDirectory></Exec></Actions>
 </Task>"#,
         sid = xml(sid),
@@ -139,17 +168,35 @@ fn target(opts: &InstallOptions) -> &Path {
 pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
     install_with(opts, target(opts), opts.dir.is_none(), &mut run_system)
 }
+pub fn start_registered(opts: &InstallOptions) -> Result<InstallReport> {
+    let dir = target(opts);
+    let label = registration_label(opts, dir)?;
+    let mut commands = Vec::new();
+    run(
+        &mut run_system,
+        &["/Run".as_ref(), "/TN".as_ref(), label.as_ref()],
+        &mut commands,
+    )?;
+    Ok(InstallReport {
+        path: dir.join("login-task.xml"),
+        label,
+        started: true,
+        commands,
+    })
+}
 pub fn install_with(
     opts: &InstallOptions,
     dir: &Path,
     manage: bool,
     runner: &mut Runner,
 ) -> Result<InstallReport> {
+    crate::fsutil::ensure_private_dir(&opts.warren_home)?;
     crate::fsutil::ensure_private_dir(dir)?;
+    let label = registration_label(opts, dir)?;
     let path = dir.join("login-task.xml");
     let existed = path.exists();
     crate::fsutil::write_private(&path, &task_xml(opts, &current_sid()?))?;
-    let label = label(opts);
+    crate::fsutil::write_json(&dir.join("login-task-name.json"), &label)?;
     let mut commands = Vec::new();
     if manage {
         if let Err(e) = run(
@@ -199,7 +246,15 @@ pub fn uninstall_with(
     runner: &mut Runner,
 ) -> Result<InstallReport> {
     let path = dir.join("login-task.xml");
-    let label = label(opts);
+    if !path.exists() && !dir.join("login-task-name.json").exists() {
+        return Ok(InstallReport {
+            path,
+            label: String::new(),
+            started: false,
+            commands: Vec::new(),
+        });
+    }
+    let label = registration_label(opts, dir)?;
     let mut commands = Vec::new();
     if manage {
         let _ = run(
@@ -227,6 +282,11 @@ pub fn uninstall_with(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    match std::fs::remove_file(dir.join("login-task-name.json")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     Ok(InstallReport {
         path,
         label,
@@ -249,6 +309,88 @@ mod tests {
             ExitStatus::from_raw(code as u32)
         }
     }
+    #[test]
+    fn stable_labels_and_saved_registration_cleanup() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        crate::fsutil::ensure_private_dir(&home).unwrap();
+        let opts = InstallOptions {
+            flavor: Flavor::TaskScheduler,
+            exe: "warren.exe".into(),
+            warren_home: home.clone(),
+            custom_home: true,
+            dir: None,
+            start: false,
+        };
+        let mut alias = opts.clone();
+        alias.warren_home = home.join(".");
+        assert_eq!(label(&opts).unwrap(), label(&alias).unwrap());
+        #[cfg(windows)]
+        {
+            alias.warren_home = PathBuf::from(home.to_str().unwrap().replace('\\', "/"));
+            assert_eq!(label(&opts).unwrap(), label(&alias).unwrap());
+        }
+        let report = install_with(&opts, &home, true, &mut |_, _| Ok(status(0))).unwrap();
+        let removed = uninstall_with(&alias, &home, true, &mut |_, args| {
+            assert!(args.iter().any(|a| a == report.label.as_str()));
+            Ok(status(0))
+        })
+        .unwrap();
+        assert_eq!(report.label, removed.label);
+        assert!(!home.join("login-task-name.json").exists());
+        crate::fsutil::write_private(&home.join("login-task.xml"), b"legacy").unwrap();
+        let mut called = false;
+        assert!(install_with(&opts, &home, true, &mut |_, _| {
+            called = true;
+            Ok(status(0))
+        })
+        .is_err());
+        assert!(
+            !called,
+            "legacy migration must not guess the old registration"
+        );
+    }
+
+    #[test]
+    fn task_restarts_only_on_failure_with_a_schema_valid_count() {
+        let opts = InstallOptions {
+            flavor: Flavor::TaskScheduler,
+            exe: "C:/warren.exe".into(),
+            warren_home: "C:/home".into(),
+            custom_home: true,
+            dir: None,
+            start: false,
+        };
+        let raw = task_xml(&opts, "S-1-5-21-1-2-3-1001");
+        let body = String::from_utf16(
+            &raw[2..]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let restart = body
+            .split("<RestartOnFailure>")
+            .nth(1)
+            .unwrap()
+            .split("</RestartOnFailure>")
+            .next()
+            .unwrap();
+        let count: u8 = restart
+            .split("<Count>")
+            .nth(1)
+            .unwrap()
+            .split("</Count>")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(count > 0);
+        assert_eq!(body.matches("<LogonTrigger>").count(), 1);
+        assert!(!body.contains("<TimeTrigger>") && !body.contains("<Repetition>"));
+        assert!(body.contains("<MultipleInstancesPolicy>IgnoreNew"));
+    }
+
     #[test]
     fn registration_no_start_restart_and_failure() {
         let t = tempfile::tempdir().unwrap();

@@ -56,7 +56,10 @@ fn temp_path(path: &Path) -> Result<PathBuf> {
         .file_name()
         .context("path has no file name")?
         .to_string_lossy();
-    Ok(dir.join(format!(".{name}.tmp{}", std::process::id())))
+    Ok(dir.join(format!(
+        ".{name}.tmp{}",
+        hex::encode(rand::random::<[u8; 16]>())
+    )))
 }
 
 /// Serialize `value` as pretty JSON into a private file.
@@ -68,11 +71,16 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// Read JSON from `path`; `Ok(None)` if it does not exist.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path) {
+    match read_private(path) {
         Ok(b) => Ok(Some(
             serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?,
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
@@ -87,6 +95,10 @@ mod unix {
     pub const FILE_MODE: u32 = 0o600;
     /// Mode for private directories.
     pub const DIR_MODE: u32 = 0o700;
+
+    pub fn read_private(path: &Path) -> Result<Vec<u8>> {
+        Ok(fs::read(path)?)
+    }
 
     /// [`ensure_private_dir`] without the warning: describes (`mode 0755`)
     /// how an existing directory that was open to group or others was set.
@@ -123,8 +135,7 @@ mod unix {
         {
             let mut f = fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(FILE_MODE)
                 .open(&tmp)
                 .with_context(|| format!("writing {}", tmp.display()))?;
@@ -197,13 +208,84 @@ mod windows {
         }
     }
 
-    /// Open a file or directory to read (and with `extra`, change) its
-    /// security descriptor. Handles avoid path length limits and races.
+    /// Pin every ancestor without write/delete sharing before resolving the next
+    /// component. Reparse points and network/device namespaces are deliberately
+    /// unsupported; this is a fail-closed local NTFS/ReFS boundary.
+    struct PinnedPath {
+        path: PathBuf,
+        _parents: Vec<fs::File>,
+    }
+    impl PinnedPath {
+        fn new(path: &Path) -> Result<Self> {
+            use std::path::{Component, Prefix};
+            let path = std::path::absolute(path)?;
+            let mut components = path.components();
+            match components.next() {
+                Some(Component::Prefix(p))
+                    if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
+                _ => anyhow::bail!("only local drive paths are supported: {}", path.display()),
+            }
+            for c in components {
+                match c {
+                    Component::ParentDir => {
+                        anyhow::bail!("parent traversal is unsupported: {}", path.display())
+                    }
+                    Component::Normal(n) if n.to_string_lossy().contains(':') => {
+                        anyhow::bail!("alternate data streams are unsupported")
+                    }
+                    _ => {}
+                }
+            }
+            let mut parents = Vec::new();
+            let mut ancestors: Vec<_> = path
+                .parent()
+                .context("path has no parent")?
+                .ancestors()
+                .collect();
+            ancestors.reverse();
+            for ancestor in ancestors {
+                let f = open_meta(ancestor, 0)?;
+                reject_alias(&f, ancestor, true)?;
+                parents.push(f);
+            }
+            let path = fs::canonicalize(path.parent().context("path has no parent")?)?
+                .join(path.file_name().context("path has no file name")?);
+            Ok(Self {
+                path,
+                _parents: parents,
+            })
+        }
+    }
+
     fn open_meta(path: &Path, extra: u32) -> io::Result<fs::File> {
         fs::OpenOptions::new()
-            .access_mode(win::READ_CONTROL | extra)
-            .custom_flags(win::FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(win::READ_CONTROL | win::FILE_READ_ATTRIBUTES | extra)
+            .share_mode(win::FILE_SHARE_READ)
+            .custom_flags(win::FILE_FLAG_BACKUP_SEMANTICS | win::FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
+    }
+
+    fn reject_alias(f: &fs::File, path: &Path, directory: bool) -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let m = f.metadata()?;
+        anyhow::ensure!(
+            m.file_attributes() & win::FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "reparse points are unsupported: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            m.is_dir() == directory,
+            "unexpected file type: {}",
+            path.display()
+        );
+        if !directory {
+            anyhow::ensure!(
+                win::file_links(f)? == 1,
+                "hard-linked private files are unsupported: {}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     fn assess(f: &fs::File, path: &Path) -> Result<sddl::Assessment> {
@@ -212,123 +294,211 @@ mod windows {
             .with_context(|| format!("permissions of {}", path.display()))
     }
 
-    /// Apply `sddl` to `path` through a handle opened for it, then check the
-    /// result (a volume that silently ignores permissions is an error).
-    fn apply(path: &Path, sddl_text: &str, want_protected: bool) -> Result<()> {
-        let f = open_meta(path, win::WRITE_DAC | win::WRITE_OWNER)
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
-        win::apply_sddl(&f, sddl_text).map_err(|e| acl_error(e, path))?;
-        let a = assess(&f, path)?;
-        if !a.is_private() || (want_protected && !a.protected) {
-            return Err(acl_error(
-                io::Error::from_raw_os_error(win::ERROR_NOT_SUPPORTED as i32),
-                path,
-            ));
-        }
+    fn apply(f: &fs::File, path: &Path, text: &str) -> Result<()> {
+        win::apply_sddl(f, text).map_err(|e| acl_error(e, path))?;
+        let a = assess(f, path)?;
+        anyhow::ensure!(
+            a.is_private() && a.protected,
+            "private protected permissions could not be verified: {}",
+            path.display()
+        );
         Ok(())
     }
 
-    /// [`ensure_private_dir`] without the warning: describes (`access for BU`)
-    /// who else had access to an existing directory. Removing only the
-    /// Administrators group (which every folder in a profile grants) is not
-    /// reported.
     pub fn make_private_dir(dir: &Path) -> Result<Option<String>> {
-        let existed = dir.is_dir();
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let a = {
-            let f = open_meta(dir, 0).with_context(|| format!("opening {}", dir.display()))?;
-            assess(&f, dir)?
-        };
+        // Create one component at a time while its ancestry remains pinned.
+        let existed = dir.exists();
+        if !dir.exists() {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if !parent.exists() {
+                    make_private_dir(parent)?;
+                }
+            }
+            let pinned = PinnedPath::new(dir)?;
+            let sd = win::SecurityDescriptor::from_sddl(&sddl::private_dir(&user()?))?;
+            match win::create_private_dir(&pinned.path, &sd) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let pinned = PinnedPath::new(dir)?;
+        let f = open_meta(&pinned.path, win::WRITE_DAC | win::WRITE_OWNER)?;
+        reject_alias(&f, dir, true)?;
+        let a = assess(&f, dir)?;
         if a.is_private() && a.protected {
             return Ok(None);
         }
-        apply(dir, &sddl::private_dir(&user()?), true)?;
+        apply(&f, dir, &sddl::private_dir(&user()?))?;
         Ok((existed && a.exposed()).then(|| a.describe()))
     }
 
-    /// [`ensure_private_file`] without the warning.
     pub fn make_private_file(path: &Path) -> Result<Option<String>> {
-        let a = match open_meta(path, 0) {
-            Ok(f) => assess(&f, path)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        let pinned = match PinnedPath::new(path) {
+            Ok(p) => p,
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
         };
-        if a.is_private() {
+        let f = match open_meta(&pinned.path, win::WRITE_DAC | win::WRITE_OWNER) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        reject_alias(&f, path, false)?;
+        let a = assess(&f, path)?;
+        if a.is_private() && a.protected {
             return Ok(None);
         }
-        apply(path, &sddl::private_file(&user()?), false)?;
+        apply(&f, path, &sddl::private_file(&user()?))?;
         Ok(a.exposed().then(|| a.describe()))
     }
 
-    /// Access for writing a private file: the data, plus changing its
-    /// owner and DACL before anything is written.
-    const WRITE_ACCESS: u32 =
-        win::FILE_GENERIC_WRITE | win::READ_CONTROL | win::WRITE_DAC | win::WRITE_OWNER;
-
-    /// Atomically replace `path` with `data`, readable only by this account
-    /// (and LocalSystem).
-    pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-        let tmp = temp_path(path)?;
-        let written = (|| -> Result<()> {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .access_mode(WRITE_ACCESS)
-                .open(&tmp)
-                .with_context(|| format!("writing {}", tmp.display()))?;
-            // Before any data: the file already inherits the private
-            // directory's entries, and now gets its own protected DACL.
-            win::apply_sddl(&f, &sddl::private_file(&user()?)).map_err(|e| acl_error(e, &tmp))?;
-            f.write_all(data)?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = written.and_then(|()| rename_retrying(&tmp, path)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
+    /// Reject previously shared policy instead of laundering it by repairing its
+    /// ACL. Harmless missing inheritance protection is repaired on this same
+    /// retained data handle; no pathname is reopened before consuming bytes.
+    fn validate_read(f: &fs::File, path: &Path) -> Result<()> {
+        reject_alias(f, path, false)?;
+        let a = assess(f, path)?;
+        anyhow::ensure!(
+            a.is_private(),
+            "refusing untrusted state in {} ({}); preserve it for explicit recovery",
+            path.display(),
+            a.describe()
+        );
+        if !a.protected {
+            apply(f, path, &sddl::private_file(&user()?))?;
         }
         Ok(())
     }
 
-    /// Replace `to` with `from`. Antivirus scanners and the search indexer
-    /// open files briefly without sharing, which makes the rename fail with a
-    /// sharing violation or "access denied": retry for up to about half a
-    /// second.
-    fn rename_retrying(from: &Path, to: &Path) -> Result<()> {
-        let mut delay = std::time::Duration::from_millis(10);
-        let mut attempt = 0;
-        loop {
-            match fs::rename(from, to) {
-                Ok(()) => return Ok(()),
-                Err(e)
-                    if attempt < 9
-                        && matches!(
-                            e.raw_os_error().map(|c| c as u32),
-                            Some(win::ERROR_SHARING_VIOLATION) | Some(win::ERROR_ACCESS_DENIED)
-                        ) =>
-                {
-                    attempt += 1;
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(std::time::Duration::from_millis(100));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("replacing {}", to.display()));
-                }
-            }
-        }
+    pub fn read_private(path: &Path) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let pinned = PinnedPath::new(path)?;
+        let mut f = open_meta(
+            &pinned.path,
+            win::FILE_GENERIC_READ | win::WRITE_DAC | win::WRITE_OWNER,
+        )?;
+        validate_read(&f, path)?;
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
-    /// Create an empty private file if missing and make it private.
+    /// Fresh unpredictable CREATE_NEW object with a private descriptor at
+    /// creation; rename by the retained handle, never by a temporary pathname.
+    pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+        let pinned = PinnedPath::new(path)?;
+        let tmp = temp_path(&pinned.path)?;
+        let sd = win::SecurityDescriptor::from_sddl(&sddl::private_file(&user()?))?;
+        let mut f = win::create_private_file(&tmp, &sd, false)?;
+        let result = (|| -> Result<()> {
+            validate_read(&f, &tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+            let mut attempts = 0;
+            loop {
+                match win::replace_file(&f, &pinned.path) {
+                    Ok(()) => return Ok(()),
+                    Err(e)
+                        if attempts < 9
+                            && matches!(
+                                e.raw_os_error().map(|c| c as u32),
+                                Some(win::ERROR_SHARING_VIOLATION) | Some(win::ERROR_ACCESS_DENIED)
+                            ) =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        })();
+        if result.is_err() {
+            let _ = win::delete_file(&f);
+        }
+        result
+    }
+
+    /// The log retains both the validated append handle and ancestor pins.
+    pub struct PrivateAppend {
+        file: fs::File,
+        _path: PinnedPath,
+    }
+    impl Write for PrivateAppend {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.file.write(b)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+    pub fn open_private_append(path: &Path) -> Result<PrivateAppend> {
+        let pinned = PinnedPath::new(path)?;
+        let sd = win::SecurityDescriptor::from_sddl(&sddl::private_file(&user()?))?;
+        let file = match win::create_private_file(&pinned.path, &sd, true) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open_meta(
+                &pinned.path,
+                win::FILE_APPEND_DATA | win::WRITE_DAC | win::WRITE_OWNER,
+            )?,
+            Err(e) => return Err(e.into()),
+        };
+        validate_read(&file, path)?;
+        Ok(PrivateAppend {
+            file,
+            _path: pinned,
+        })
+    }
+
     pub fn touch_private(path: &Path) -> Result<()> {
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .access_mode(WRITE_ACCESS)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        win::apply_sddl(&f, &sddl::private_file(&user()?)).map_err(|e| acl_error(e, path))
+        open_private_append(path).map(|_| ())
+    }
+
+    #[cfg(test)]
+    mod security_tests {
+        use super::*;
+        #[test]
+        fn retained_data_and_ancestor_handles_reject_replacement() {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("home");
+            make_private_dir(&dir).unwrap();
+            let path = dir.join("state.json");
+            write_private(&path, b"1").unwrap();
+            let pinned = PinnedPath::new(&path).unwrap();
+            let f = open_meta(
+                &pinned.path,
+                win::FILE_GENERIC_READ | win::WRITE_DAC | win::WRITE_OWNER,
+            )
+            .unwrap();
+            validate_read(&f, &path).unwrap();
+            assert!(fs::rename(&dir, t.path().join("replaced")).is_err());
+            assert!(fs::rename(&path, dir.join("replaced.json")).is_err());
+            assert!(fs::write(&path, b"2").is_err());
+            drop(f);
+            drop(pinned);
+            assert_eq!(read_private(&path).unwrap(), b"1");
+        }
+        #[test]
+        fn hardlinked_state_and_retained_writers_are_rejected() {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("home");
+            make_private_dir(&dir).unwrap();
+            let path = dir.join("state.json");
+            write_private(&path, b"1").unwrap();
+            let link = dir.join("alias.json");
+            fs::hard_link(&path, &link).unwrap();
+            assert!(read_private(&path).is_err());
+            fs::remove_file(link).unwrap();
+            let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            assert!(read_private(&path).is_err());
+            drop(writer);
+            assert_eq!(read_private(&path).unwrap(), b"1");
+        }
     }
 
     /// True if only this account and LocalSystem have access to `path`, and
@@ -358,6 +528,20 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preplanted_old_temporary_hardlink_cannot_redirect_writes() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("home");
+        ensure_private_dir(&dir).unwrap();
+        let canary = t.path().join("canary");
+        fs::write(&canary, b"untouched").unwrap();
+        let planted = dir.join(format!(".key.tmp{}", std::process::id()));
+        fs::hard_link(&canary, &planted).unwrap();
+        write_private(&dir.join("key"), b"secret").unwrap();
+        assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+        assert_eq!(fs::read(dir.join("key")).unwrap(), b"secret");
+    }
 
     #[test]
     fn private_files_and_dirs() {

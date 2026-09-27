@@ -119,6 +119,7 @@ async fn devices_with_a_few_hundred_enrolled_machines() {
 /// unsuccessful exit, systemd `Restart=on-failure`), so `warren down` is not
 /// undone on an installed machine.
 #[test]
+#[cfg(unix)]
 fn installed_service_does_not_undo_warren_down() {
     use warren::install::{launchd_plist, systemd_unit, Flavor, InstallOptions};
     let o = InstallOptions {

@@ -386,11 +386,7 @@ fn init_background_logging(paths: &NodePaths) -> Result<(), CliError> {
     paths.ensure()?;
     crate::fsutil::ensure_private_dir(&paths.logs())?;
     let path = paths.logs().join("warren.log");
-    crate::fsutil::touch_private(&path)?;
-    let file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .map_err(anyhow::Error::from)?;
+    let file = crate::fsutil::open_private_append(&path)?;
     let spec = std::env::var("WARREN_LOG").ok();
     let filter = tracing_subscriber::EnvFilter::try_new(log_directives(spec.as_deref(), "info"))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_directives(None, "info")));
@@ -1328,9 +1324,19 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         Command::Install { no_start, dir } => {
             let o = install_opts(paths, dir, !no_start)?;
             #[cfg(windows)]
-            if o.dir.is_none() && o.start {
+            let r = if o.dir.is_none() && o.start {
+                let mut prepared = o.clone();
+                prepared.start = false;
+                let mut report = install::install(&prepared)?;
                 stop_for_install(paths).await?;
-            }
+                let started = install::start_registered(&o)?;
+                report.started = started.started;
+                report.commands.extend(started.commands);
+                report
+            } else {
+                install::install(&o)?
+            };
+            #[cfg(unix)]
             let r = install::install(&o)?;
             #[cfg(windows)]
             if r.started {

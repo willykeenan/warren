@@ -123,7 +123,8 @@ pub fn certified_key_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<Cer
 /// Load a certificate chain and key from files.
 pub fn load_cert_files(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>> {
     let c = std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?;
-    let k = std::fs::read(key).with_context(|| format!("reading {}", key.display()))?;
+    let k =
+        crate::fsutil::read_private(key).with_context(|| format!("reading {}", key.display()))?;
     certified_key_from_pem(&c, &k)
 }
 
@@ -152,6 +153,7 @@ pub fn persistent_self_signed(
         crate::fsutil::write_private(&key_path, k.as_bytes())?;
         crate::fsutil::write_private(&cert_path, c.as_bytes())?;
     }
+    #[cfg(unix)]
     crate::fsutil::ensure_private_file(&key_path)?;
     let ck = load_cert_files(&cert_path, &key_path)?;
     let fp = cert_sha256(ck.cert[0].as_ref());

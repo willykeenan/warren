@@ -150,6 +150,7 @@ impl fmt::Debug for IdentityFile {
 
 impl IdentityFile {
     pub fn load(paths: &NodePaths) -> Result<IdentityFile> {
+        #[cfg(unix)]
         fsutil::ensure_private_file(&paths.identity())?;
         fsutil::read_json(&paths.identity())?.ok_or_else(|| {
             anyhow!(

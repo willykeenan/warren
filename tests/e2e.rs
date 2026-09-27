@@ -57,6 +57,19 @@ async fn join_share_forward_and_nc() {
         .unwrap()
         .unwrap();
     assert_eq!(&interactive, b"interactive");
+    // More than one frame, all byte values, before either side sends EOF.
+    let binary: Vec<u8> = (0..131_329).map(|i| (i % 256) as u8).collect();
+    let mut echoed = vec![0; binary.len()];
+    let (sent, received) = tokio::join!(
+        async {
+            w.write_all(&binary).await?;
+            w.flush().await
+        },
+        tokio::time::timeout(Duration::from_secs(10), r.read_exact(&mut echoed)),
+    );
+    sent.unwrap();
+    received.unwrap().unwrap();
+    assert_eq!(echoed, binary);
     w.write_all(b"hello over nc\n").await.unwrap();
     w.shutdown().await.unwrap();
     let mut got = Vec::new();

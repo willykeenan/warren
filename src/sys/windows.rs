@@ -26,10 +26,11 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    GetTokenInformation, TokenOwner, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY,
-    TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    GetTokenInformation, TokenIntegrityLevel, TokenOwner, TokenUser, ACL,
+    DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SE_DACL_PROTECTED, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::System::Console::{
     FreeConsole, GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT,
@@ -41,8 +42,9 @@ pub use windows_sys::Win32::Foundation::{
     ERROR_PIPE_BUSY, ERROR_SHARING_VIOLATION,
 };
 pub use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE, FILE_SHARE_READ, READ_CONTROL,
-    SECURITY_IDENTIFICATION, WRITE_DAC, WRITE_OWNER,
+    FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, READ_CONTROL, SECURITY_IDENTIFICATION, WRITE_DAC, WRITE_OWNER,
 };
 pub use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
@@ -129,7 +131,9 @@ fn token_sid(class: TOKEN_INFORMATION_CLASS) -> io::Result<String> {
     if len == 0 {
         return Err(last_error());
     }
-    // u64 elements: 8-byte alignment for TOKEN_USER / TOKEN_OWNER.
+    // u64 elements: 8-byte alignment for TOKEN_USER / TOKEN_OWNER /
+    // TOKEN_MANDATORY_LABEL (the latter begins with the same SID_AND_ATTRIBUTES
+    // member as TOKEN_USER).
     let mut buf = vec![0u64; (len as usize).div_ceil(8)];
     // SAFETY: `buf` is writable for at least `len` bytes.
     check(unsafe {
@@ -145,7 +149,7 @@ fn token_sid(class: TOKEN_INFORMATION_CLASS) -> io::Result<String> {
     // suitably aligned; its SID pointer points into the same buffer, which
     // lives until the end of this function.
     let sid = unsafe {
-        if class == TokenUser {
+        if class != TokenOwner {
             (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid
         } else {
             (*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner
@@ -176,6 +180,10 @@ pub fn default_owner_sid() -> io::Result<String> {
     Ok(SID.get_or_init(|| s).clone())
 }
 
+pub fn current_integrity_sid() -> io::Result<String> {
+    token_sid(TokenIntegrityLevel)
+}
+
 /// What kind of object a handle refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Object {
@@ -198,6 +206,16 @@ impl Object {
 /// READ_CONTROL access.
 pub fn security_sddl(h: &impl AsRawHandle, kind: Object) -> io::Result<String> {
     let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    security_sddl_with(h, kind, info)
+}
+
+/// Mandatory labels can be queried with READ_CONTROL, without requesting the
+/// audit SACL privilege. Keep this separate from the DACL classifier.
+pub fn integrity_sddl(h: &impl AsRawHandle, kind: Object) -> io::Result<String> {
+    security_sddl_with(h, kind, LABEL_SECURITY_INFORMATION)
+}
+
+fn security_sddl_with(h: &impl AsRawHandle, kind: Object, info: u32) -> io::Result<String> {
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: the handle is open while `h` is borrowed; only the whole
     // descriptor is requested (the optional part pointers are null); on
@@ -381,4 +399,118 @@ pub fn free_console() {
 pub fn send_ctrl_break(process_group: u32) -> io::Result<()> {
     // SAFETY: plain values; the call has no memory arguments.
     check(unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group) })
+}
+
+/// Create an exclusive file with its private descriptor already attached.
+pub fn create_private_file(
+    path: &std::path::Path,
+    sd: &SecurityDescriptor,
+    append: bool,
+) -> io::Result<std::fs::File> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL,
+    };
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    let access = READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | DELETE
+        | if append {
+            FILE_APPEND_DATA
+        } else {
+            FILE_GENERIC_WRITE
+        };
+    // SAFETY: terminated name and valid descriptor outlive CreateFileW; the
+    // returned handle is transferred exactly once into File.
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            access,
+            FILE_SHARE_READ,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(raw) })
+}
+
+pub fn file_links(file: &std::fs::File) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file remains open and info is a valid writable output.
+    check(unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) })?;
+    Ok(info.nNumberOfLinks)
+}
+
+/// Atomic replacement through the source handle; the caller retains pins for
+/// the entire destination ancestry. No attacker-controlled source path lookup.
+pub fn replace_file(file: &std::fs::File, destination: &std::path::Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let bytes = offset + name.len() * 2;
+    let mut buffer = vec![
+        0u64;
+        bytes
+            .max(std::mem::size_of::<FILE_RENAME_INFO>())
+            .div_ceil(8)
+    ];
+    // SAFETY: the allocation has structure alignment and space for the full
+    // variable-length UTF-16 name. The system reads it only during this call.
+    unsafe {
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = ptr::null_mut();
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        check(SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfo,
+            info.cast(),
+            bytes as u32,
+        ))
+    }
+}
+
+pub fn delete_file(file: &std::fs::File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: a valid initialized structure and live DELETE-capable handle.
+    check(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    })
+}
+
+pub fn create_private_dir(path: &std::path::Path, sd: &SecurityDescriptor) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: the name and descriptor remain valid until creation finishes.
+    check(unsafe { CreateDirectoryW(name.as_ptr(), &sa) })
 }

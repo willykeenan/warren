@@ -358,6 +358,7 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
     let paths = cfg.paths.clone();
     paths.ensure()?;
+    #[cfg(unix)]
     crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
     let id = ident.identity()?;
