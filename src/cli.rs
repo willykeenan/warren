@@ -486,14 +486,26 @@ async fn relay_cmd(r: RelayCmd, out: &Out) -> Result<(), CliError> {
     match r.sub {
         None => run_relay(r.run, out).await,
         Some(RelaySub::Invite { name, state }) => {
-            let db = Db::open(&state_dir(state)?)?;
             let ttl = crate::limits::INVITE_TTL;
             let now = crate::now_secs();
+            let dir = state_dir(state)?;
+            let db = Db::open(&dir)?;
             let code = db.create_invite(name.as_deref(), ttl, now)?;
-            let v = json!({"code": code, "name": name, "expires_at": now + ttl.as_secs() as i64});
+            // A self-signed relay: nodes must pin its certificate.
+            let pins = self_signed_pins(&dir);
+            let pin_arg = match pins.as_slice() {
+                [p] => format!(" --insecure-relay-cert-sha256 {p}"),
+                _ => String::new(),
+            };
+            let v = json!({
+                "code": code,
+                "name": name,
+                "expires_at": now + ttl.as_secs() as i64,
+                "self_signed_cert_sha256": pins,
+            });
             out.print(&v, || {
                 format!(
-                    "{code}\n\nOne-time code, valid for 10 minutes{}. On the new machine run:\n  warren join {code} --relay https://<relay host>",
+                    "{code}\n\nOne-time code, valid for 10 minutes{}. On the new machine run:\n  warren join {code} --relay https://<relay host>{pin_arg}",
                     name.as_ref().map(|n| format!(", for a machine named {n}")).unwrap_or_default()
                 )
             });
@@ -590,22 +602,7 @@ async fn relay_cmd(r: RelayCmd, out: &Out) -> Result<(), CliError> {
             let dir = state_dir(state)?;
             let db = Db::open(&dir)?;
             let nodes = db.nodes()?;
-            let mut pins = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if n.starts_with("self-signed-") && n.ends_with(".crt") {
-                        if let Ok(pem) = std::fs::read(&p) {
-                            use rustls::pki_types::pem::PemObject;
-                            if let Ok(der) = rustls::pki_types::CertificateDer::from_pem_slice(&pem)
-                            {
-                                pins.push(hex::encode(crate::tls::cert_sha256(der.as_ref())));
-                            }
-                        }
-                    }
-                }
-            }
+            let pins = self_signed_pins(&dir);
             let v = json!({
                 "state": dir,
                 "nodes": nodes.iter().filter(|n| n.revoked_at.is_none()).count(),
@@ -623,6 +620,28 @@ async fn relay_cmd(r: RelayCmd, out: &Out) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// SHA-256 pins (hex) of the self-signed certificates in a relay's state
+/// directory; empty unless the relay runs with `--self-signed`.
+fn self_signed_pins(dir: &std::path::Path) -> Vec<String> {
+    let mut pins = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if n.starts_with("self-signed-") && n.ends_with(".crt") {
+                if let Ok(pem) = std::fs::read(&p) {
+                    use rustls::pki_types::pem::PemObject;
+                    if let Ok(der) = rustls::pki_types::CertificateDer::from_pem_slice(&pem) {
+                        pins.push(hex::encode(crate::tls::cert_sha256(der.as_ref())));
+                    }
+                }
+            }
+        }
+    }
+    pins.sort();
+    pins
 }
 
 async fn run_relay(r: RelayRun, out: &Out) -> Result<(), CliError> {

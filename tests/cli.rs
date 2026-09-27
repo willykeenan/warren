@@ -197,19 +197,51 @@ async fn binary_end_to_end() {
     let pin = ev["cert_sha256"].as_str().unwrap().to_string();
     let url = format!("https://127.0.0.1:{port}");
 
-    // Enrollment.
+    // Enrollment. The invite of a self-signed relay names its pin.
     let mut codes = Vec::new();
-    for _ in 0..2 {
-        let v = env
-            .ok(
-                "relayhome",
-                &["--json", "relay", "invite", "--state", state_s],
-            )
-            .await;
-        let code = v["code"].as_str().unwrap().to_string();
+    let v = env
+        .ok(
+            "relayhome",
+            &["--json", "relay", "invite", "--state", state_s],
+        )
+        .await;
+    assert_eq!(v["self_signed_cert_sha256"], serde_json::json!([pin]));
+    codes.push(v["code"].as_str().unwrap().to_string());
+    let o = env
+        .run("relayhome", &["relay", "invite", "--state", state_s])
+        .await;
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stdout.contains(&format!(
+            "--relay https://<relay host> --insecure-relay-cert-sha256 {pin}"
+        )),
+        "{}",
+        o.stdout
+    );
+    codes.push(o.stdout.lines().next().unwrap().trim().to_string());
+    for code in &codes {
         assert_eq!(code.len(), 10);
-        codes.push(code);
     }
+    // A relay URL whose host is not the relay's --domain is explained.
+    let o = env
+        .run(
+            "c",
+            &[
+                "join",
+                &codes[0],
+                "--relay",
+                &format!("https://localhost:{port}"),
+                "--insecure-relay-cert-sha256",
+                &pin,
+            ],
+        )
+        .await;
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert!(
+        o.stderr.contains("HTTP 404") && o.stderr.contains("must be the relay's --domain"),
+        "{}",
+        o.stderr
+    );
     for (home, code) in [("a", &codes[0]), ("b", &codes[1])] {
         let v = env
             .ok(

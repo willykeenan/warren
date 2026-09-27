@@ -33,11 +33,20 @@ pub async fn connect_relay(url: &RelayUrl, pin: Option<[u8; 32]>) -> Result<Clie
             .connect(crate::tls::server_name(&url.host)?, tcp)
             .await
             .context("TLS handshake with the relay")?;
-        let (ws, _resp) =
-            tokio_tungstenite::client_async_with_config(url.node_ws(), tls, Some(config()))
-                .await
-                .context("WebSocket upgrade with the relay")?;
-        Ok::<_, anyhow::Error>(ws)
+        let upgrade =
+            tokio_tungstenite::client_async_with_config(url.node_ws(), tls, Some(config())).await;
+        match upgrade {
+            Ok((ws, _)) => Ok(ws),
+            // The relay answers 404 for any host other than its own domain.
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status() == 404 => {
+                anyhow::bail!(
+                    "the relay did not accept {}/v1/node (HTTP 404); the host in --relay \
+                     must be the relay's --domain",
+                    url.https()
+                )
+            }
+            Err(e) => Err(anyhow::Error::new(e).context("WebSocket upgrade with the relay")),
+        }
     };
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
         .await
