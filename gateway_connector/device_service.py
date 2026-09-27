@@ -21,6 +21,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from gateway_connector import discovery as local_interfaces
+
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 ATTACH_PROTOCOLS = {"http", "https", "rtsp", "smb", "ipp", "ipps"}
 DISCOVERY_PROTOCOLS = ATTACH_PROTOCOLS | {"onvif"}
@@ -188,6 +190,7 @@ class DeviceService:
         self.lock = threading.Lock()
         self.scanning = threading.Lock()
         self.scans = {}
+        self.interface_selection = {}  # Advisory, process-local, replaced by each successful list.
         try:
             saved = self.store.read("devices.json", {"version": 1, "devices": {}})
             if (not isinstance(saved, dict) or set(saved) != {"version", "devices"}
@@ -265,6 +268,20 @@ class DeviceService:
             raise DeviceError("gateway_status_unavailable", 503) from None
 
     def dispatch(self, method, path, body):
+        if method == "GET" and path == "/v1/interfaces":
+            if not self.scanning.acquire(blocking=False):
+                raise DeviceError("discovery_already_running", 409)
+            try:
+                try:
+                    rows = local_interfaces.list_interfaces()
+                except local_interfaces.PlatformNotQualified:
+                    raise DeviceError("platform_not_qualified", 503) from None
+                except local_interfaces.DiscoveryError:
+                    raise DeviceError("interfaces_unavailable", 503) from None
+                self.interface_selection = {row["cidr"]: row["name"] for row in rows}
+                return {"interfaces": rows, "discovery_limits": {"deadline_seconds": 5, "max_hosts": 256}}
+            finally:
+                self.scanning.release()
         if method == "GET" and path == "/v1/summary":
             return self.public_summary()
         if method == "GET" and path == "/v1/devices":
@@ -286,8 +303,20 @@ class DeviceService:
             if not self.scanning.acquire(blocking=False):
                 raise DeviceError("discovery_already_running", 409)
             try:
-                # Discovery independently verifies an actual gateway interface.
-                rows = self.discover(body["interface"], deadline_seconds=5.0, max_hosts=256)
+                try:
+                    interface = local_interfaces._host_interface(body["interface"])
+                except ValueError:
+                    raise DeviceError("invalid_interface") from None
+                try:
+                    # discover re-enumerates before sockets; the map is only advisory.
+                    rows = self.discover(body["interface"], deadline_seconds=5.0, max_hosts=256,
+                                         expected_interface_name=self.interface_selection.get(str(interface)))
+                except local_interfaces.InterfaceChanged:
+                    raise DeviceError("interface_changed", 409) from None
+                except local_interfaces.PlatformNotQualified:
+                    raise DeviceError("platform_not_qualified", 503) from None
+                except local_interfaces.DiscoveryError:
+                    raise DeviceError("interfaces_unavailable", 503) from None
                 if not isinstance(rows, list):
                     raise DeviceError("invalid_discovery_result", 503)
                 clean, addresses = [], set()

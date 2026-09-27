@@ -5,7 +5,7 @@ This isolated standard-library Python module performs one explicit, bounded disc
 ## Integration API
 
 ```python
-from gateway_connector.discovery import DiscoveryError, discover, build_public_summary
+from gateway_connector.discovery import DiscoveryError, discover, list_interfaces, build_public_summary
 
 # Supply the selected interface's actual host address AND actual prefix.
 # Invoke only in the gateway process after the user's discovery action.
@@ -14,9 +14,21 @@ from gateway_connector.discovery import DiscoveryError, discover, build_public_s
 # public_status = build_public_summary(devices)
 ```
 
-`discover(interface_cidr: str, *, deadline_seconds=5.0, max_hosts=256, cancel=None) -> list[dict]` validates the selected CIDR before opening any socket. The address and prefix must match exactly one active OS interface. A network-only CIDR, fabricated address, wider prefix, ambiguous duplicate interface address, public subnet, loopback, CGNAT, or `/0` fails closed with `DiscoveryError`. Supported address ranges are RFC1918, IPv4 link-local, IPv6 ULA and IPv6 link-local; the entire selected subnet must fit inside one of those ranges.
+`discover(interface_cidr: str, *, deadline_seconds=5.0, max_hosts=256, cancel=None, expected_interface_name=None) -> list[dict]` validates the selected CIDR before opening any socket. The address and prefix must match exactly one active OS interface. A network-only CIDR, fabricated address, wider prefix, ambiguous duplicate interface address, public subnet, loopback, CGNAT, or `/0` fails closed with `DiscoveryError`. Supported address ranges are RFC1918, IPv4 link-local excluding the metadata address, and IPv6 ULA; the entire selected subnet must fit inside one of those ranges.
 
-The macOS adapter reads `/sbin/ifconfig -a`, requiring UP/RUNNING and rejecting inactive interfaces. The Linux adapter reads `ip -j address show up`, requiring UP and an UP/UNKNOWN operational state while rejecting tentative/DAD-failed addresses. The Linux `ip` utility must be installed. These fixed-argument subprocesses use `shell=False`, a timeout of at most two seconds within the overall deadline, and a one-MiB parsed-output cap. Windows deliberately raises `DiscoveryError` until its active-interface adapter exists. A CIDR supplied by the UI is never accepted as proof of locality.
+`list_interfaces()` returns up to 64 private, uniquely selectable local host
+CIDRs with exactly `name`, `address`, `prefix_length`, `cidr`, and `family` fields.
+It opens no sockets and performs no discovery or DNS. IPv6 link-local/scoped
+addresses are excluded until the target path supports scope. Duplicate IPs
+(including different prefixes), IPv4 network/broadcast addresses and metadata
+address `169.254.169.254` are excluded. Empty eligibility returns an empty list.
+Labels use 1–64 ASCII letters, digits, `_`, `.`, `:`, or `-` and are plain text.
+`expected_interface_name` optionally binds discovery to the OS name last shown;
+a missing, moved or ambiguous selection raises `InterfaceChanged` before sockets.
+An invalid host CIDR raises `DiscoveryError`; unsupported platforms raise
+`PlatformNotQualified`. A caller must refresh and explicitly reselect on change.
+
+The macOS adapter reads `/sbin/ifconfig -a`, requiring UP/RUNNING and rejecting inactive interfaces. The Linux adapter reads `ip -j address show up`, requiring UP and an UP/UNKNOWN operational state while rejecting tentative/DAD-failed addresses. Both adapters strictly validate address families, labels and prefix data; malformed metadata fails closed. The Linux `ip` utility must be installed. These fixed-argument subprocesses use `shell=False`, a two-second command/parse budget within the overall deadline, and a one-MiB cap while reading stdout. Stderr is discarded, timeout/output overflow kills and reaps the owned command, and cleanup is bounded separately (up to one second, subject to OS scheduling). Windows deliberately raises `DiscoveryError` until its active-interface adapter exists. A CIDR supplied by the UI is never accepted as proof of locality.
 
 `cancel` accepts a `threading.Event`-compatible object or a zero-argument boolean callback. A cancellation or deadline returns observations collected so far, with all sockets closed. A callback must return promptly. Limits outside `0 < deadline_seconds <= 30` and integer `1 <= max_hosts <= 256` are rejected. The deadline includes interface enumeration; normal event-loop cancellation latency is at most its 50 ms selector wait, plus bounded parsing and local OS-call time. This is not a hard real-time guarantee.
 
@@ -42,7 +54,7 @@ The standalone packet APIs are `parse_mdns_packet(data: bytes, source_ip: str)`,
 - One pass probes at most `max_hosts` addresses from the chosen subnet's ascending host sequence, excluding the gateway address, on TCP ports 80, 443, 554, 445 and 631. It stops at the overall deadline. Large networks are intentionally incomplete.
 - At most 16 sockets are open at once, including three multicast listeners; normally at most 13 TCP connections are pending. Each pending TCP attempt expires after at most 350 ms. Sockets bind the selected local IP and use a one-hop TTL/hop limit. There are no retries or background jobs.
 - IPv4 sends one small query each for mDNS (`224.0.0.251:5353`), SSDP (`239.255.255.250:1900`) and ONVIF WS-Discovery (`239.255.255.250:3702`). Each socket sets `IP_MULTICAST_IF` and TTL 1. mDNS requests unicast replies using the QU bit from an ephemeral source port; no multicast group joins or privileged ports are needed.
-- IPv6 performs the same capped TCP sequence only; IPv6 multicast discovery is not implemented. Link-local sockets use the chosen interface's scope ID. Scanning the first 256 addresses of a typical `/64` is not effective address enumeration; the UI must describe this coverage honestly.
+- IPv6 performs the same capped TCP sequence only; IPv6 multicast discovery is not implemented. Scoped/link-local IPv6 interfaces are excluded from selection. Scanning the first 256 addresses of a typical `/64` is not effective address enumeration; the UI must describe this coverage honestly.
 - Replies from outside the selected subnet, IPv4 broadcast/network addresses and the gateway itself are ignored. At most 256 datagrams, 16 KiB per datagram, and `max_hosts` output devices are processed/retained. DNS is additionally capped at 32 questions and 128 records with bounded label expansion and backward-pointer/loop checks; malformed or conflicting address/SRV records are ignored.
 - SSDP requires a literal same-sender HTTP(S) Location and drops that URL after extracting the scheme and port. ONVIF accepts a bounded UTF-8 SOAP ProbeMatch for NetworkVideoTransmitter, rejects DTD/entity declarations and other-sender endpoints, and discards XAddrs, scopes and UUIDs. Neither parser fetches anything.
 

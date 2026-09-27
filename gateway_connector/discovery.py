@@ -6,6 +6,8 @@ performs I/O; callers explicitly invoke discover with an active interface CIDR.
 from __future__ import annotations
 
 import errno
+import os
+from collections import Counter
 import ipaddress
 import io
 import itertools
@@ -295,51 +297,140 @@ def parse_onvif_reply(data: bytes, source_ip: str) -> list[dict]:
         return []
 
 
+class InterfaceChanged(DiscoveryError):
+    """A selected host CIDR no longer identifies the same unique interface."""
+
+
+class PlatformNotQualified(DiscoveryError):
+    """The platform has no qualified local interface adapter."""
+
+
 def _run_interface_command(argv, timeout):
+    # Bound bytes while reading, rather than buffering arbitrary command output.
+    deadline = time.monotonic() + min(timeout, 2.0)
+    process = None
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=True, shell=False)
-    except (OSError, subprocess.SubprocessError) as exc:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, shell=False)
+        chunks, size = [], 0
+        with selectors.DefaultSelector() as ready:
+            ready.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not ready.select(remaining):
+                    raise DiscoveryError("Local interface enumeration timed out")
+                data = os.read(process.stdout.fileno(), 8192)
+                if not data:
+                    break
+                size += len(data)
+                if size > 1_048_576:
+                    raise DiscoveryError("Interface listing exceeded limit")
+                chunks.append(data)
+        if process.wait(timeout=max(.001, deadline - time.monotonic())) != 0:
+            raise DiscoveryError("Cannot inspect active local interfaces")
+        return b"".join(chunks).decode("utf-8", "strict")
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         raise DiscoveryError("Cannot inspect active local interfaces") from exc
-    if len(result.stdout) > 1_048_576:
-        raise DiscoveryError("Interface listing exceeded limit")
-    return result.stdout
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=1)
+            process.stdout.close()
+
+
+def _interface_label(value):
+    # Use OS labels verbatim as plain text; never derive Wi-Fi/Ethernet names.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", value):
+        raise ValueError("invalid interface label")
+    return value
 
 
 def _active_interfaces(timeout):
-    """Return (interface name, ip_interface) pairs from local OS metadata only."""
-    system = platform.system()
-    found = []
+    """Return strictly parsed local OS metadata, without sockets or probes."""
+    deadline = time.monotonic() + min(timeout, 2.0)
+    system, found = platform.system(), []
     try:
         if system == "Linux":
             raw = _run_interface_command(["ip", "-j", "address", "show", "up"], timeout)
-            rows = json.loads(raw)
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate interface metadata key")
+                    result[key] = value
+                return result
+            rows = json.loads(raw, object_pairs_hook=unique_object)
             if not isinstance(rows, list) or len(rows) > 512:
                 raise ValueError("invalid interface listing")
             for row in rows:
-                if "UP" not in row.get("flags", []) or "LOOPBACK" in row.get("flags", []):
+                if not isinstance(row, dict):
+                    raise ValueError("invalid interface row")
+                name = _interface_label(row.get("ifname"))
+                flags, addresses = row.get("flags"), row.get("addr_info")
+                if (not isinstance(flags, list) or any(not isinstance(f, str) for f in flags)
+                        or not isinstance(addresses, list) or len(addresses) > 256):
+                    raise ValueError("invalid interface fields")
+                if "UP" not in flags or "LOOPBACK" in flags or row.get("operstate") not in ("UP", "UNKNOWN"):
                     continue
-                if row.get("operstate") not in ("UP", "UNKNOWN"):
-                    continue
-                for addr in row.get("addr_info", []):
-                    if addr.get("family") not in ("inet", "inet6") or any(addr.get(f) for f in ("tentative", "dadfailed")) or set(addr.get("flags", [])) & {"tentative", "dadfailed"}:
+                for addr in addresses:
+                    if not isinstance(addr, dict):
+                        raise ValueError("invalid interface address")
+                    flags = addr.get("flags", [])
+                    if not isinstance(flags, list) or any(not isinstance(f, str) for f in flags):
+                        raise ValueError("invalid address flags")
+                    if addr.get("family") not in ("inet", "inet6"):
                         continue
-                    found.append((row["ifname"], ipaddress.ip_interface(f"{addr['local']}/{addr['prefixlen']}")))
+                    if any(addr.get(f) for f in ("tentative", "dadfailed")) or set(flags) & {"tentative", "dadfailed"}:
+                        continue
+                    address, prefix = addr.get("local"), addr.get("prefixlen")
+                    if not isinstance(address, str) or type(prefix) is not int:
+                        raise ValueError("invalid host CIDR")
+                    if "%" in address:
+                        continue
+                    interface = ipaddress.ip_interface(f"{address}/{prefix}")
+                    if (interface.version == 4) != (addr["family"] == "inet"):
+                        raise ValueError("address family mismatch")
+                    found.append((name, interface))
         elif system == "Darwin":
             raw = _run_interface_command(["/sbin/ifconfig", "-a"], timeout)
-            for block in re.split(r"(?m)(?=^[^\s:]+: flags=)", raw):
-                header = re.match(r"([^\s:]+): flags=\d+<([^>]+)>", block)
-                if not header or not {"UP", "RUNNING"}.issubset(set(header[2].split(","))):
+            blocks = re.split(r"(?m)(?=^[^\s:]+: flags=)", raw)
+            for block in blocks:
+                if not block.strip():
                     continue
-                if "LOOPBACK" in header[2].split(",") or re.search(r"status:\s*inactive", block):
+                header = re.match(r"([^\s:]+): flags=\d+<([^>]*)>", block)
+                if not header:
+                    raise ValueError("invalid interface header")
+                name, flags = _interface_label(header[1]), set(header[2].split(","))
+                if not {"UP", "RUNNING"}.issubset(flags) or "LOOPBACK" in flags or re.search(r"status:\s*inactive", block):
                     continue
-                for address, mask in re.findall(r"(?m)^\s+inet ([\d.]+) netmask (0x[\da-fA-F]+|[\d.]+)", block):
-                    if mask.startswith("0x"):
-                        mask = str(ipaddress.IPv4Address(int(mask, 16)))
-                    found.append((header[1], ipaddress.ip_interface(f"{address}/{mask}")))
-                for address, prefix in re.findall(r"(?m)^\s+inet6 ([\da-fA-F:%\w.]+) prefixlen (\d+)", block):
-                    found.append((header[1], ipaddress.ip_interface(f"{address.split('%')[0]}/{prefix}")))
+                for line in block.splitlines()[1:]:
+                    words = line.split()
+                    if not words or words[0] not in ("inet", "inet6"):
+                        continue
+                    if any(word.lower() in {"tentative", "duplicated", "dadfailed", "detached"} for word in words):
+                        continue
+                    # Point-to-point interfaces insert a numeric peer before the mask.
+                    offset = 4 if len(words) > 2 and words[2] == "-->" else 2
+                    if len(words) <= offset + 1 or words[offset] != ("netmask" if words[0] == "inet" else "prefixlen"):
+                        raise ValueError("invalid interface address")
+                    if offset == 4:
+                        peer = ipaddress.ip_address(words[3])
+                        if (peer.version == 4) != (words[0] == "inet"):
+                            raise ValueError("point-to-point address family mismatch")
+                    address, prefix = words[1], words[offset + 1]
+                    if "%" in address:
+                        continue
+                    if words[0] == "inet" and prefix.startswith("0x"):
+                        prefix = str(ipaddress.IPv4Address(int(prefix, 16)))
+                    interface = ipaddress.ip_interface(f"{address}/{prefix}")
+                    if (interface.version == 4) != (words[0] == "inet"):
+                        raise ValueError("address family mismatch")
+                    found.append((name, interface))
         else:
-            raise DiscoveryError("Local subnet validation supports macOS and Linux; Windows is not supported yet")
+            raise PlatformNotQualified("Local interface platform is not qualified")
+        if len(found) > 4096 or time.monotonic() >= deadline:
+            raise DiscoveryError("Local interface enumeration exceeded budget")
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, DiscoveryError):
             raise
@@ -347,21 +438,52 @@ def _active_interfaces(timeout):
     return found
 
 
-def _select_interface(cidr, timeout):
+def _host_interface(cidr):
+    if not isinstance(cidr, str) or not re.fullmatch(r"[^%/]+/[0-9]{1,3}", cidr):
+        raise ValueError("host CIDR required")
+    interface = ipaddress.ip_interface(cidr)
+    address = interface.ip
+    if (not any(interface.version == n.version and interface.network.subnet_of(n) for n in _ALLOWED)
+            or _private_ip(str(address)) is None or str(address) == "169.254.169.254"
+            or (address.version == 6 and (address.is_link_local or address.ipv4_mapped))
+            or (address.version == 4 and interface.network.prefixlen < 31
+                and address in (interface.network.network_address, interface.network.broadcast_address))):
+        raise ValueError("unsupported private host CIDR")
+    return interface
+
+
+def _selectable_interfaces(timeout):
+    rows = _active_interfaces(min(timeout, 2.0))
+    # The same IP under two prefixes/names is ambiguous as well as duplicate CIDRs.
+    counts = Counter(str(address.ip) for _, address in rows)
+    eligible = []
+    for name, address in rows:
+        try:
+            _interface_label(name)
+            _host_interface(str(address))
+        except ValueError:
+            continue
+        if counts[str(address.ip)] == 1:
+            eligible.append((name, address))
+    return sorted(eligible, key=lambda row: (row[0], row[1].version, int(row[1].ip), row[1].network.prefixlen))
+
+
+def list_interfaces():
+    """At most 64 selectable local host CIDRs; two-second metadata budget."""
+    return [{"name": name, "address": str(address.ip), "prefix_length": address.network.prefixlen,
+             "cidr": str(address), "family": "ipv4" if address.version == 4 else "ipv6"}
+            for name, address in _selectable_interfaces(2.0)[:64]]
+
+
+def _select_interface(cidr, timeout, expected_name=None):
     try:
-        if not isinstance(cidr, str) or "/" not in cidr or "%" in cidr:
-            raise ValueError("host CIDR required")
-        requested = ipaddress.ip_interface(cidr)
-        if not any(requested.version == n.version and requested.network.subnet_of(n) for n in _ALLOWED):
-            raise ValueError("not a private or link-local subnet")
-        if _private_ip(str(requested.ip)) is None:
-            raise ValueError("not a local address")
-        matches = [(name, address) for name, address in _active_interfaces(timeout) if address == requested]
-        if len(matches) != 1:
-            raise ValueError("CIDR must match one active local interface address and prefix exactly")
-        return matches[0]
+        requested = _host_interface(cidr)
     except ValueError as exc:
-        raise DiscoveryError(str(exc)) from exc
+        raise DiscoveryError("Invalid private interface selection") from exc
+    matches = [(name, address) for name, address in _selectable_interfaces(timeout) if address == requested]
+    if len(matches) != 1 or (expected_name is not None and matches[0][0] != expected_name):
+        raise InterfaceChanged("Interface selection changed")
+    return matches[0]
 
 
 def _cancelled(cancel):
@@ -396,7 +518,7 @@ def _in_subnet(value, network):
     return not (address.version == 4 and network.prefixlen < 31 and address in (network.network_address, network.broadcast_address))
 
 
-def discover(interface_cidr: str, *, deadline_seconds=5.0, max_hosts=256, cancel=None) -> list[dict]:
+def discover(interface_cidr: str, *, deadline_seconds=5.0, max_hosts=256, cancel=None, expected_interface_name=None) -> list[dict]:
     """One bounded discovery pass on one verified local interface.
 
     Raises DiscoveryError/ValueError before traffic for unsupported or invalid
@@ -411,7 +533,7 @@ def discover(interface_cidr: str, *, deadline_seconds=5.0, max_hosts=256, cancel
     deadline = started + deadline_seconds
     if _cancelled(cancel):
         return []
-    interface_name, interface = _select_interface(interface_cidr, min(2.0, deadline_seconds))
+    interface_name, interface = _select_interface(interface_cidr, min(2.0, deadline_seconds), expected_interface_name)
     if _cancelled(cancel) or time.monotonic() >= deadline:
         return []
     family = socket.AF_INET if interface.version == 4 else socket.AF_INET6

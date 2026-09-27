@@ -36,7 +36,51 @@ Warren transport is required and this is not an Internet-facing HTTP server.
 ## Contract for the phone/desktop owner
 
 All endpoints except `/v1/summary` are gateway-local private data. Do not forward
-their records to the hub. `POST /v1/discover` takes `{"interface":"192.168.1.10/24"}`
+their records to the hub or widget telemetry.
+
+`GET /v1/interfaces` requires the same bearer, Host and Origin guards as every
+other endpoint. It reads only local OS metadata; listing sends no packets, opens
+no network socket and performs no DNS lookup. Example (documentation addresses):
+
+```json
+{"interfaces":[{"name":"en0","address":"192.168.1.10","prefix_length":24,"cidr":"192.168.1.10/24","family":"ipv4"}],"discovery_limits":{"deadline_seconds":5,"max_hosts":256}}
+```
+
+Only these five interface fields are returned. Names are unmodified OS labels
+restricted to 1–64 ASCII letters, digits, `_`, `.`, `:`, or `-`; render as plain
+text. The service never infers a Wi-Fi/Ethernet role or substitutes a /24. No MAC,
+SSID, route, bearer, credential, device name or other OS metadata is returned.
+At most 64 records are returned in deterministic label/address order after all
+ambiguity checks. Eligible records are active private host addresses with their
+actual prefixes, excluding loopback, public/metadata/boundary addresses, scoped
+or link-local IPv6, tentative/failed addresses and duplicate IP selections even
+when the duplicates have different names or prefixes. IPv6 ULA is supported.
+An empty eligible list is a successful `interfaces:[]`; the native client should
+explain that no supported active interface is available, without starting a scan.
+
+Enumeration has a two-second local-command/parse budget and a one-MiB output
+read cap. macOS uses `/sbin/ifconfig -a`; Linux uses `ip -j address show up`.
+Malformed output, command failure or timeout returns 503 `interfaces_unavailable`.
+Windows/other unsupported enumeration returns 503 `platform_not_qualified`;
+Windows private-state ACL qualification also remains a service startup boundary.
+Neither error includes raw OS output. Process termination/OS scheduling cleanup
+can extend the wall-clock return beyond the enumeration budget; this is not a
+hard real-time guarantee.
+
+Listing and discovery serialize on one request lock; overlapping operations
+return 409 `discovery_already_running`. A successful list replaces a process-local
+map of at most 64 CIDRs to OS names. This map only detects a renamed/moved issued
+selection; it is not authorization or a substitute for fresh OS metadata. It is
+lost on restart, and a later successful list replaces it. There is no durable
+interface identity or per-client selection token. Discovery without a preceding
+list still requires a fresh unique exact host/prefix match. Missing, changed-prefix,
+duplicate or known moved selections return 409 `interface_changed` **before any
+discovery socket opens**; the client must refresh and explicitly reselect. Malformed
+or unsupported host CIDRs return 400 `invalid_interface`. The server never silently
+selects another name or scans all interfaces. Changes after validation remain an
+OS/network race; this is not a lease on the interface configuration.
+
+`POST /v1/discover` takes `{"interface":"192.168.1.10/24"}`
 where the CIDR exactly matches an active **host address and prefix** on the
 gateway. The discovery module verifies that interface independently, uses bounded
 mDNS/SSDP/WS-Discovery and common-port probes, and does not follow advertised URLs.
@@ -99,12 +143,13 @@ the API preserves the uncertain record and does not replay a grant.
 `python3 -m unittest discover -s tests -p test_device_service.py -v` exercises
 real loopback HTTP, state permissions and single-writer locking, concurrent
 attach, strict selection and credentials rejection, saved-state restart,
-uncertain results, failed persistence, manual removal, daemon failure, and CLI
-acknowledgement parsing. Warren and discovery calls are controlled test doubles;
+uncertain results, failed persistence, manual removal, daemon failure, CLI
+acknowledgement parsing, authenticated interface listing, private response fields,
+serialized selection and stale-interface rejection before traffic. Warren and discovery calls are controlled test doubles;
 these tests are not evidence of live-device attachment or phone delivery.
 
 Required next integration: secure native enrollment/token custody, active
-interface selection, the three Add device paths, phone/desktop screens and
+native interface-selection UI, the three Add device paths, phone/desktop screens and
 viewers, sensitive camera controls and local stream conversion, gateway status
 plumbing, two-node end-to-end tests, native Windows qualification, and the real
 LAN-device/simulated-iPhone acceptance. No installation or release occurs here.

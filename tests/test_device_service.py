@@ -3,6 +3,7 @@ import concurrent.futures
 import http.client
 import importlib.util
 import json
+import ipaddress
 import os
 from pathlib import Path
 import socket
@@ -176,7 +177,7 @@ class DeviceTests(unittest.TestCase):
         self.rows += [{**base, "services": None}, {**base, "services": [{"protocol": [], "port": 80}]}]
         result = self.service.dispatch("POST", "/v1/discover", {"interface": "192.168.1.10/24"})
         self.assertEqual(len(result["devices"]), 1)
-        self.assertEqual(self.discovery_calls[0][1], {"deadline_seconds": 5.0, "max_hosts": 256})
+        self.assertEqual(self.discovery_calls[0][1], {"deadline_seconds": 5.0, "max_hosts": 256, "expected_interface_name": None})
 
     def test_only_one_state_writer(self):
         with self.assertRaisesRegex(api.DeviceError, "device_service_already_running"):
@@ -232,6 +233,52 @@ class DeviceTests(unittest.TestCase):
         registry.symlink_to(self.path / "auth.json")
         with self.assertRaises(OSError):
             api.DeviceService(self.path, self.warren, self.discover)
+
+    def test_list_mapping_is_bounded_replaced_and_discovery_serialized(self):
+        d = api.local_interfaces
+        local = ipaddress.ip_interface("192.168.1.10/24")
+        with patch.object(d, "_active_interfaces", return_value=[("en0", local)]):
+            result = self.service.dispatch("GET", "/v1/interfaces", {})
+        self.assertEqual(result["discovery_limits"], {"deadline_seconds": 5, "max_hosts": 256})
+        self.assertEqual(self.service.interface_selection, {str(local): "en0"})
+        with patch.object(d, "_active_interfaces", return_value=[]):
+            self.assertEqual(self.service.dispatch("GET", "/v1/interfaces", {})["interfaces"], [])
+        self.assertEqual(self.service.interface_selection, {})
+        self.service.scanning.acquire()
+        try:
+            with patch.object(d, "list_interfaces") as listing:
+                with self.assertRaisesRegex(api.DeviceError, "discovery_already_running"):
+                    self.service.dispatch("GET", "/v1/interfaces", {})
+                listing.assert_not_called()
+        finally: self.service.scanning.release()
+
+    def test_stale_moved_and_ambiguous_selection_is_409_before_network(self):
+        d = api.local_interfaces
+        local = ipaddress.ip_interface("192.168.1.10/24")
+        self.service.discover = d.discover
+        for rows in [[], [("en1", local)], [("en0", ipaddress.ip_interface("192.168.1.10/25"))],
+                     [("en0", local), ("en1", local)]]:
+            with patch.object(d, "_active_interfaces", return_value=[("en0", local)]):
+                self.service.dispatch("GET", "/v1/interfaces", {})
+            with patch.object(d, "_active_interfaces", return_value=rows), patch.object(socket, "socket", side_effect=AssertionError("no traffic")):
+                with self.assertRaises(api.DeviceError) as failure:
+                    self.service.dispatch("POST", "/v1/discover", {"interface": str(local)})
+                self.assertEqual((failure.exception.status, failure.exception.code), (409, "interface_changed"))
+        self.assertEqual(self.service.scans, {})
+
+    def test_map_never_replaces_fresh_validation_and_invalid_host_rejected(self):
+        d = api.local_interfaces
+        self.service.discover = d.discover
+        for mapping in [{}, {"192.168.1.10/24": "en0"}]:
+            self.service.interface_selection = mapping
+            with patch.object(d, "_active_interfaces", return_value=[]) as active, patch.object(socket, "socket", side_effect=AssertionError("no traffic")):
+                with self.assertRaisesRegex(api.DeviceError, "interface_changed"):
+                    self.service.dispatch("POST", "/v1/discover", {"interface": "192.168.1.10/24"})
+                active.assert_called_once()
+        for value in ["192.168.1.0/24", "192.168.1.10", "fe80::1/64", "169.254.169.254/16"]:
+            with self.assertRaisesRegex(api.DeviceError, "invalid_interface"):
+                self.service.dispatch("POST", "/v1/discover", {"interface": value})
+
 
 
 class WarrenClientTests(unittest.TestCase):
@@ -308,6 +355,28 @@ class HttpTests(unittest.TestCase):
                 self.assertNotIn("secret", json.dumps(response[2]))
         self.warren.fail = True
         self.assertEqual(self.request()[2], {"error": "gateway_status_unavailable"})
+
+    def test_interfaces_authenticated_no_store_and_safe_schema(self):
+        d = api.local_interfaces
+        with patch.object(d, "_active_interfaces", return_value=[("en0", ipaddress.ip_interface("192.168.1.10/24"))]) as active:
+            self.assertEqual(self.request(path="/v1/interfaces", headers={"Authorization": "Bearer wrong"})[0], 401)
+            active.assert_not_called()
+            status, headers, body = self.request(path="/v1/interfaces")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(body, {"interfaces": [{"name": "en0", "address": "192.168.1.10", "prefix_length": 24,
+            "cidr": "192.168.1.10/24", "family": "ipv4"}], "discovery_limits": {"deadline_seconds": 5, "max_hosts": 256}})
+        self.assertEqual(self.service.public_summary(), {"attached_device_count": 0})
+
+    def test_interfaces_empty_failure_and_platform_errors(self):
+        d = api.local_interfaces
+        with patch.object(d, "_active_interfaces", return_value=[]):
+            self.assertEqual(self.request(path="/v1/interfaces")[2]["interfaces"], [])
+        for error, code in [(d.DiscoveryError("private diagnostic"), "interfaces_unavailable"),
+                            (d.PlatformNotQualified("Windows"), "platform_not_qualified")]:
+            with patch.object(d, "list_interfaces", side_effect=error):
+                response = self.request(path="/v1/interfaces")
+            self.assertEqual((response[0], response[2]), (503, {"error": code}))
 
     def test_duplicate_authorization_rejected(self):
         port = self.http.server_address[1]

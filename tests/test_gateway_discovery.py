@@ -6,6 +6,8 @@ import selectors
 import socket
 import struct
 import subprocess
+import sys
+import time
 import threading
 import types
 import unittest
@@ -156,7 +158,7 @@ class InterfaceTests(unittest.TestCase):
                     d._select_interface(value, 1)
 
     def test_local_ranges(self):
-        for cidr in ("10.1.2.3/24", "172.16.1.2/24", "169.254.1.2/24", "fd00::1/120", "fe80::1/64"):
+        for cidr in ("10.1.2.3/24", "172.16.1.2/24", "169.254.1.2/24", "fd00::1/120"):
             interface = ipaddress.ip_interface(cidr)
             with mock.patch.object(d, "_active_interfaces", return_value=[("en0", interface)]):
                 self.assertEqual(d._select_interface(cidr, 1)[1], interface)
@@ -181,21 +183,131 @@ en1: flags=8863<UP,BROADCAST,RUNNING> mtu 1500
 \tstatus: inactive
 """
         with mock.patch.object(d.platform, "system", return_value="Darwin"), mock.patch.object(d, "_run_interface_command", return_value=listing):
-            self.assertEqual(d._active_interfaces(1), [("en0", LOCAL), ("en0", ipaddress.ip_interface("fe80::123/64"))])
+            self.assertEqual(d._active_interfaces(1), [("en0", LOCAL)])
 
     def test_interface_commands_bounded_argv_no_shell(self):
-        with mock.patch.object(d.subprocess, "run", return_value=types.SimpleNamespace(stdout="ok")) as run:
-            self.assertEqual(d._run_interface_command(["/sbin/ifconfig", "-a"], 0.3), "ok")
-            self.assertEqual(run.call_args.kwargs["timeout"], 0.3)
+        with mock.patch.object(d.subprocess, "Popen", wraps=subprocess.Popen) as run:
+            self.assertEqual(d._run_interface_command([sys.executable, "-c", "print('ok')"], .5), "ok\n")
             self.assertFalse(run.call_args.kwargs["shell"])
-        with mock.patch.object(d.subprocess, "run", side_effect=subprocess.TimeoutExpired(["ip"], 0.3)), self.assertRaises(d.DiscoveryError):
-            d._run_interface_command(["ip"], 0.3)
+            self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        started = time.monotonic()
+        with self.assertRaises(d.DiscoveryError):
+            d._run_interface_command([sys.executable, "-c", "import time; time.sleep(5)"], .03)
+        self.assertLess(time.monotonic() - started, 1.5)
 
     def test_windows_and_invalid_metadata_fail_closed(self):
         with mock.patch.object(d.platform, "system", return_value="Windows"), self.assertRaises(d.DiscoveryError):
             d._active_interfaces(1)
         with mock.patch.object(d.platform, "system", return_value="Linux"), mock.patch.object(d, "_run_interface_command", return_value="{}"), self.assertRaises(d.DiscoveryError):
             d._active_interfaces(1)
+
+
+class InterfaceListingTests(unittest.TestCase):
+    def linux(self, rows):
+        with mock.patch.object(d.platform, "system", return_value="Linux"), mock.patch.object(d, "_run_interface_command", return_value=json.dumps(rows)):
+            return d.list_interfaces()
+
+    def row(self, name="eth0", ip="192.168.50.10", prefix=24, **extra):
+        return {"ifname": name, "flags": ["UP"], "operstate": "UP", "addr_info": [
+            {"family": "inet6" if ":" in ip else "inet", "local": ip, "prefixlen": prefix, **extra}]}
+
+    def test_safe_schema_multiple_interfaces_no_network_calls(self):
+        rows = [self.row(), self.row("eth1", "10.2.3.4", 16), self.row("tun0", "fd00::2", 64)]
+        with mock.patch.object(d.socket, "socket", side_effect=AssertionError("network forbidden")), mock.patch.object(d.socket, "getaddrinfo", side_effect=AssertionError("DNS forbidden")):
+            result = self.linux(rows)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0], {"name": "eth0", "address": "192.168.50.10", "prefix_length": 24,
+                                     "cidr": "192.168.50.10/24", "family": "ipv4"})
+        self.assertEqual(result[-1]["family"], "ipv6")
+        self.assertTrue(all(set(r) == {"name", "address", "prefix_length", "cidr", "family"} for r in result))
+
+    def test_excludes_public_metadata_boundary_scoped_and_link_local_ipv6(self):
+        rows = [self.row(ip=ip, prefix=prefix) for ip, prefix in [
+            ("8.8.8.8", 24), ("127.0.0.1", 8), ("169.254.169.254", 16), ("192.168.50.0", 24),
+            ("192.168.50.255", 24), ("fe80::1", 64), ("fd00::1%en0", 64), ("::ffff:192.168.1.2", 120),
+            ("192.168.1.1", 8), ("2001:db8::1", 64)]]
+        self.assertEqual(self.linux(rows), [])
+
+    def test_ambiguous_same_ip_under_names_or_prefixes_excluded(self):
+        self.assertEqual(self.linux([self.row(), self.row("eth1")]), [])
+        self.assertEqual(self.linux([self.row(), self.row(prefix=25)]), [])
+        self.assertEqual(self.linux([self.row(), self.row()]), [])
+
+    def test_down_loopback_tentative_and_dad_failed_excluded(self):
+        rows = [self.row(tentative=True), self.row(dadfailed=True), self.row(flags=["tentative"])]
+        down = self.row(); down["operstate"] = "DOWN"; rows.append(down)
+        loopback = self.row(); loopback["flags"].append("LOOPBACK"); rows.append(loopback)
+        self.assertEqual(self.linux(rows), [])
+
+    def test_response_cap_and_ambiguity_checked_before_cap(self):
+        rows = [self.row(f"eth{i:03}", f"10.0.1.{i}") for i in range(1, 80)]
+        rows.append(self.row("duplicate", "10.0.1.1"))
+        result = self.linux(rows)
+        self.assertEqual(len(result), 64)
+        self.assertNotIn("10.0.1.1/24", [r["cidr"] for r in result])
+
+    def test_malformed_linux_fields_fail_closed(self):
+        cases = [[None], [self.row(prefix=True)], [self.row(prefix=129)],
+                 [self.row(ip="not-an-address")], [self.row(flags="tentative")]]
+        for key, value in [("ifname", "<script>"), ("ifname", "bad\nname"), ("ifname", "x"*65),
+                           ("flags", "UP"), ("addr_info", {})]:
+            row=self.row(); row[key]=value; cases.append([row])
+        for rows in cases:
+            with self.subTest(rows=rows), self.assertRaises(d.DiscoveryError): self.linux(rows)
+
+    def test_duplicate_os_json_keys_fail_closed(self):
+        raw = '[{"ifname":"eth0","ifname":"eth1","flags":["UP"],"operstate":"UP","addr_info":[]}]'
+        with mock.patch.object(d.platform, "system", return_value="Linux"), mock.patch.object(d, "_run_interface_command", return_value=raw), self.assertRaises(d.DiscoveryError):
+            d.list_interfaces()
+
+    def test_macos_tentative_scoped_and_malformed(self):
+        listing = """stf0: flags=0<> mtu 1280
+en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500
+    inet 192.168.50.10 netmask 0xffffff00
+    inet6 fd00::1 prefixlen 64 tentative
+    inet6 fd00::2 prefixlen 64 duplicated
+    inet6 fe80::1%en0 prefixlen 64 scopeid 0x4
+    inet6 fd00::3 prefixlen 64
+    status: active
+"""
+        with mock.patch.object(d.platform, "system", return_value="Darwin"), mock.patch.object(d, "_run_interface_command", return_value=listing):
+            self.assertEqual([r["cidr"] for r in d.list_interfaces()], [str(LOCAL), "fd00::3/64"])
+        for invalid in ["garbage", listing.replace("0xffffff00", "0xff00ff00"), listing.replace("192.168.50.10", "bad")]:
+            with mock.patch.object(d.platform, "system", return_value="Darwin"), mock.patch.object(d, "_run_interface_command", return_value=invalid), self.assertRaises(d.DiscoveryError):
+                d.list_interfaces()
+
+    def test_macos_point_to_point_preserves_host_prefix_only(self):
+        listing = """utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+    inet 10.9.0.1 --> 10.9.0.2 netmask 0xffffffff
+    inet6 fd02::1 --> fd02::2 prefixlen 128
+"""
+        with mock.patch.object(d.platform, "system", return_value="Darwin"), mock.patch.object(d, "_run_interface_command", return_value=listing):
+            rows = d.list_interfaces()
+        self.assertEqual([row["cidr"] for row in rows], ["10.9.0.1/32", "fd02::1/128"])
+        self.assertNotIn("10.9.0.2", json.dumps(rows))
+        self.assertNotIn("fd02::2", json.dumps(rows))
+
+    def test_enumeration_budget_covers_parser_and_windows_fails_closed(self):
+        with mock.patch.object(d.platform, "system", return_value="Linux"), mock.patch.object(d, "_run_interface_command", return_value="[]") as run, mock.patch.object(d.time, "monotonic", side_effect=[100., 102.1]):
+            with self.assertRaises(d.DiscoveryError): d.list_interfaces()
+            self.assertEqual(run.call_args.args[1], 2.0)
+        with mock.patch.object(d.platform, "system", return_value="Windows"), mock.patch.object(d, "_run_interface_command") as run:
+            with self.assertRaises(d.PlatformNotQualified): d.list_interfaces()
+            run.assert_not_called()
+
+    def test_bounded_command_failure_invalid_utf8_and_oversized_output(self):
+        for source in ["raise SystemExit(2)", "import os; os.write(1,b'\\xff')", "import os; os.write(1,b'x'*2000000)"]:
+            with self.subTest(source=source), self.assertRaises(d.DiscoveryError):
+                d._run_interface_command([sys.executable, "-c", source], 1)
+        with self.assertRaises(d.DiscoveryError): d._run_interface_command(["/nonexistent/interface-command"], 1)
+
+    def test_selection_stale_renamed_or_ambiguous_opens_no_socket(self):
+        for rows in [[], [("en0", ipaddress.ip_interface("192.168.50.10/25"))],
+                     [("en1", LOCAL)], [("en0", LOCAL), ("en1", LOCAL)]]:
+            with mock.patch.object(d, "_active_interfaces", return_value=rows), mock.patch.object(d.socket, "socket", side_effect=AssertionError("network forbidden")):
+                with self.assertRaises(d.InterfaceChanged):
+                    d.discover(str(LOCAL), expected_interface_name="en0")
+
 
 
 class FakeClock:
