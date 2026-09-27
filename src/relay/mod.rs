@@ -98,6 +98,10 @@ pub struct RelayInner {
     pub resolver: Arc<CertResolver>,
     acceptor: TlsAcceptor,
     pub registry: RwLock<Registry>,
+    /// Serializes [`RelayInner::reload`]: a reload that read the database
+    /// before a change must not install its registry after one that read it
+    /// afterwards.
+    reload_lock: Mutex<()>,
     pub online: Mutex<HashMap<String, Arc<NodeLink>>>,
     pub join_limiter: Mutex<FailureLimiter>,
     pub shutdown: CancellationToken,
@@ -155,6 +159,7 @@ impl RelayInner {
 
     /// Reload the registry from the database; kick links of revoked nodes.
     pub fn reload(&self) -> Result<()> {
+        let _serial = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
         let rev = self.db.revision()?;
         let nodes = self.db.nodes()?;
         let pubs = self.db.publishes()?;
@@ -280,6 +285,7 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
         resolver,
         acceptor,
         registry: RwLock::new(Registry::default()),
+        reload_lock: Mutex::new(()),
         online: Mutex::new(HashMap::new()),
         join_limiter: Mutex::new(FailureLimiter::new(
             limits::JOIN_FAILURES_PER_WINDOW,
