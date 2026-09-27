@@ -14,12 +14,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cli;
 pub mod crypto;
 pub mod fsutil;
 pub mod http;
+pub mod install;
 pub mod limits;
 pub mod mux;
 pub mod net;
+pub mod node;
 pub mod noise;
 pub mod proto;
 pub mod relay;
