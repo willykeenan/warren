@@ -22,6 +22,7 @@ pub mod mux;
 pub mod net;
 pub mod noise;
 pub mod proto;
+pub mod relay;
 pub mod tls;
 pub mod ws;
 
