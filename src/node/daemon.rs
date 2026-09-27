@@ -753,8 +753,25 @@ impl DaemonInner {
         let (r, w) = tcp.into_split();
         let up = mux::copy_to_stream(r, &tx);
         let down = mux::copy_from_stream(&mut rx, w);
-        let (a, b) = tokio::join!(up, down);
-        if a.is_err() || b.is_err() {
+        tokio::pin!(up);
+        tokio::pin!(down);
+        let (mut up_done, mut down_done) = (false, false);
+        // Either direction failing (e.g. the relay reset the stream because
+        // the public client left) ends both, so an idle backend connection
+        // is not held open.
+        while !(up_done && down_done) {
+            tokio::select! {
+                r = &mut up, if !up_done => {
+                    up_done = true;
+                    if r.is_err() { break; }
+                }
+                r = &mut down, if !down_done => {
+                    down_done = true;
+                    if r.is_err() { break; }
+                }
+            }
+        }
+        if !(up_done && down_done) {
             tx.reset(ErrorCode::Aborted);
         }
     }
@@ -1004,6 +1021,12 @@ impl DaemonInner {
                     return ControlResponse::err("bad_request", "invalid forward");
                 }
                 let f = Forward { local, node, port };
+                // Replacing a forward on the same port: stop the old listener first.
+                let old = self.forwards.lock().unwrap().remove(&local);
+                if let Some(ForwardState { task: Some(t), .. }) = old {
+                    t.abort();
+                    let _ = t.await;
+                }
                 if let Err(e) = self.start_forward(f.clone()) {
                     return ControlResponse::err("bind_failed", format!("{e:#}"));
                 }

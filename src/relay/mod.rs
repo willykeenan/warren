@@ -98,8 +98,9 @@ pub struct RelayInner {
     pub join_limiter: Mutex<FailureLimiter>,
     pub shutdown: CancellationToken,
     next_conn: std::sync::atomic::AtomicU64,
-    pub public_slots: Arc<Semaphore>,
-    pub public_per_ip: Mutex<HashMap<IpAddr, usize>>,
+    /// Concurrent client connections (any kind) and per-IP counts.
+    pub conn_slots: Arc<Semaphore>,
+    pub conns_per_ip: Mutex<HashMap<IpAddr, usize>>,
     pub acme: Option<Arc<acme::AcmeManager>>,
     pub cert_sha256: Option<[u8; 32]>,
 }
@@ -282,8 +283,8 @@ pub async fn start(cfg: RelayConfig) -> Result<RelayHandle> {
         )),
         shutdown: CancellationToken::new(),
         next_conn: std::sync::atomic::AtomicU64::new(1),
-        public_slots: Arc::new(Semaphore::new(limits::MAX_PUBLIC_CONNECTIONS)),
-        public_per_ip: Mutex::new(HashMap::new()),
+        conn_slots: Arc::new(Semaphore::new(limits::MAX_CONNECTIONS)),
+        conns_per_ip: Mutex::new(HashMap::new()),
         acme: acme_mgr.clone(),
         cert_sha256,
     });
@@ -393,9 +394,52 @@ pub(crate) async fn drain<R: tokio::io::AsyncRead + Unpin>(r: &mut R) {
     .await;
 }
 
+/// Holds one of a client IP's connection slots.
+struct IpSlot {
+    inner: Arc<RelayInner>,
+    ip: IpAddr,
+}
+
+impl IpSlot {
+    fn acquire(inner: &Arc<RelayInner>, ip: IpAddr) -> Option<IpSlot> {
+        let mut m = inner.conns_per_ip.lock().unwrap();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= limits::MAX_CONNECTIONS_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot {
+            inner: inner.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut m = self.inner.conns_per_ip.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn handle_conn(inner: Arc<RelayInner>, tcp: TcpStream, peer: SocketAddr) {
     let _ = tcp.set_nodelay(true);
     let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+    // Bound the number of connections (including ones still in the TLS
+    // handshake), overall and per client address.
+    let Ok(_slot) = inner.conn_slots.clone().try_acquire_owned() else {
+        tracing::warn!(%peer, "connection limit reached; dropping connection");
+        return;
+    };
+    let Some(_ip_slot) = IpSlot::acquire(&inner, peer.ip()) else {
+        tracing::debug!(%peer, "per-address connection limit reached");
+        return;
+    };
     let deadline = tokio::time::Instant::now() + inner.cfg.header_timeout;
     let shutdown = inner.shutdown.clone();
     let work = async {

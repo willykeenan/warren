@@ -24,10 +24,10 @@ pub const INVITE_TTL: Duration = Duration::from_secs(600);
 pub const NODE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 /// A link whose outbound queue exceeds this many bytes is considered stuck and closed.
 pub const MAX_LINK_QUEUE: usize = 64 * 1024 * 1024;
-/// Maximum concurrent public connections on a relay.
-pub const MAX_PUBLIC_CONNECTIONS: usize = 8192;
-/// Maximum concurrent public connections from one client IP.
-pub const MAX_PUBLIC_CONNECTIONS_PER_IP: usize = 256;
+/// Maximum concurrent client connections on a relay (nodes and public).
+pub const MAX_CONNECTIONS: usize = 16384;
+/// Maximum concurrent connections from one client IP.
+pub const MAX_CONNECTIONS_PER_IP: usize = 256;
 
 /// Classic token bucket.
 #[derive(Debug)]
@@ -122,6 +122,28 @@ impl FailureLimiter {
     pub fn record(&mut self, ip: IpAddr) {
         self.record_at(ip, Instant::now())
     }
+
+    /// Start an attempt: counts as a failure until [`FailureLimiter::forgive`]
+    /// is called, so concurrent attempts cannot exceed the limit. Returns
+    /// false (and records nothing) if `ip` is already blocked.
+    pub fn begin(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        if self.blocked_at(ip, now) {
+            return false;
+        }
+        self.record_at(ip, now);
+        true
+    }
+
+    /// Undo the provisional failure of a successful attempt.
+    pub fn forgive(&mut self, ip: IpAddr) {
+        if let Some(q) = self.failures.get_mut(&ip) {
+            q.pop_back();
+            if q.is_empty() {
+                self.failures.remove(&ip);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +179,21 @@ mod tests {
         assert!(!l.blocked_at(other, t0));
         assert!(l.blocked_at(ip, t0 + Duration::from_secs(599)));
         assert!(!l.blocked_at(ip, t0 + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn provisional_attempts_count() {
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let mut l = FailureLimiter::new(5, Duration::from_secs(600));
+        // Five concurrent attempts are admitted, the sixth is not.
+        for _ in 0..5 {
+            assert!(l.begin(ip));
+        }
+        assert!(!l.begin(ip));
+        // A successful attempt gives its slot back.
+        l.forgive(ip);
+        assert!(l.begin(ip));
+        assert!(!l.begin(ip));
     }
 
     #[test]

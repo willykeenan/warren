@@ -192,5 +192,5 @@ and are `0600`.
 | public TLS handshake + request head | 10 s |
 | public idle connection | 5 min |
 | public request head | 32 KiB |
-| public connections | 8192 total, 256 per client IP |
+| relay connections (any kind) | 16384 total, 256 per client IP |
 | enrollment failures | 5 per IP per 10 minutes |

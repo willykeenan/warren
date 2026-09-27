@@ -792,7 +792,9 @@ fn handle_join(
     signature: &str,
 ) -> RelayVerdict {
     let ip = peer.ip();
-    if inner.join_limiter.lock().unwrap().blocked(ip) {
+    // Every attempt counts as a failure until it succeeds, so concurrent
+    // attempts from one address cannot exceed the limit either.
+    if !inner.join_limiter.lock().unwrap().begin(ip) {
         tracing::warn!(%ip, "enrollment refused: too many failed attempts");
         return verdict_error(
             "rate_limited",
@@ -800,12 +802,16 @@ fn handle_join(
         );
     }
     let fail = |code: &str, msg: &str| {
-        inner.join_limiter.lock().unwrap().record(ip);
         tracing::info!(%ip, reason = code, "enrollment failed");
         verdict_error(code, msg)
     };
+    // Refusals that are not guesses at a code do not count.
+    let refuse = |code: &str, msg: &str| {
+        inner.join_limiter.lock().unwrap().forgive(ip);
+        verdict_error(code, msg)
+    };
     if version != PROTOCOL_VERSION {
-        return verdict_error("version", "unsupported protocol version");
+        return refuse("version", "unsupported protocol version");
     }
     let Some(code) = crypto::normalize_code(code) else {
         return fail(
@@ -829,11 +835,12 @@ fn handle_join(
     }
     if let Some(n) = name {
         if !crate::valid_name(n) {
-            return verdict_error("bad_name", "names must match [a-z0-9-]{1,32}");
+            return refuse("bad_name", "names must match [a-z0-9-]{1,32}");
         }
     }
     match inner.db.join(&code, name, &sp, &xp, crate::now_secs()) {
         Ok(JoinOutcome::Joined(rec)) => {
+            inner.join_limiter.lock().unwrap().forgive(ip);
             let _ = inner.reload();
             tracing::info!(node = %rec.name, %ip, "node enrolled");
             RelayVerdict::Joined {
@@ -846,18 +853,18 @@ fn handle_join(
             "invalid_code",
             "invalid, expired or already used enrollment code",
         ),
-        Ok(JoinOutcome::NameTaken(n)) => verdict_error(
+        Ok(JoinOutcome::NameTaken(n)) => refuse(
             "name_taken",
             &format!("the name {n:?} is already in use on this relay"),
         ),
         Ok(JoinOutcome::BadName(n)) if n.is_empty() => {
-            verdict_error("bad_name", "a name is required (use --name)")
+            refuse("bad_name", "a name is required (use --name)")
         }
-        Ok(JoinOutcome::BadName(n)) => verdict_error("bad_name", &format!("invalid name {n:?}")),
-        Ok(JoinOutcome::KeyInUse) => verdict_error("key_in_use", "this key is already registered"),
+        Ok(JoinOutcome::BadName(n)) => refuse("bad_name", &format!("invalid name {n:?}")),
+        Ok(JoinOutcome::KeyInUse) => refuse("key_in_use", "this key is already registered"),
         Err(e) => {
             tracing::warn!("enrollment database error: {e:#}");
-            verdict_error("internal", "internal error")
+            refuse("internal", "internal error")
         }
     }
 }

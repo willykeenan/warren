@@ -80,6 +80,17 @@ async fn join_share_forward_and_nc() {
     let adev = list.iter().find(|d| d["name"] == "a").unwrap();
     assert_eq!(adev["pin"], "self");
 
+    // Re-adding a forward on the same local port replaces it.
+    a.ctl_ok(ControlRequest::ForwardAdd {
+        local,
+        node: "b".into(),
+        port: echo,
+    })
+    .await;
+    assert_eq!(echo_roundtrip(local, b"replaced").await, b"replaced");
+    let st = a.ctl_ok(ControlRequest::Status).await;
+    assert_eq!(st["forwards"].as_array().unwrap().len(), 1);
+
     // Removing the forward closes its listener.
     a.ctl_ok(ControlRequest::ForwardRemove { local }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1246,4 +1257,34 @@ async fn custom_domain_routes_to_published_name() {
         .unwrap();
     assert_eq!(read_response(&mut rc).await.0, 404);
     assert!(admin.remove_domain("app.example.org").unwrap());
+}
+
+/// SR6: connection floods are bounded per client address, including
+/// connections that never finish the TLS handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_address_connection_limit() {
+    let relay = start_relay_with(|c| c.header_timeout = Duration::from_secs(5)).await;
+    let mut held = Vec::new();
+    for _ in 0..warren::limits::MAX_CONNECTIONS_PER_IP {
+        held.push(tokio::net::TcpStream::connect(relay.addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // One more from the same address is dropped at once.
+    let mut extra = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), extra.read_to_end(&mut buf)).await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "excess connection was not dropped"
+    );
+    // The held ones are still open (their handshake deadline has not passed).
+    let mut probe = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_millis(200), held[0].read(&mut probe)).await;
+    assert!(r.is_err(), "held connection closed early");
+    // Releasing them frees the slots again.
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a = enroll(&relay, "a").await;
+    let _raw = RawNode::connect(&relay, &a).await;
 }

@@ -9,7 +9,7 @@ use super::RelayInner;
 use crate::http::{
     simple_response, Activity, BodyKind, BufConn, ByteSink, HttpError, MuxSink, Request, WriteSink,
 };
-use crate::limits::{MAX_PUBLIC_CONNECTIONS_PER_IP, MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD};
+use crate::limits::{MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD};
 use crate::mux::{MuxReceiver, MuxSender};
 use crate::proto::ErrorCode;
 use std::net::SocketAddr;
@@ -40,23 +40,6 @@ enum ReqInfo {
     Reject(Vec<u8>),
 }
 
-struct IpSlot {
-    inner: Arc<RelayInner>,
-    ip: std::net::IpAddr,
-}
-
-impl Drop for IpSlot {
-    fn drop(&mut self) {
-        let mut m = self.inner.public_per_ip.lock().unwrap();
-        if let Some(n) = m.get_mut(&self.ip) {
-            *n -= 1;
-            if *n == 0 {
-                m.remove(&self.ip);
-            }
-        }
-    }
-}
-
 async fn reply_close<W: AsyncWrite + Unpin>(w: &mut W, code: u16, reason: &str, body: &str) {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = w
@@ -77,33 +60,6 @@ pub async fn serve(
     peer: SocketAddr,
     activity: Arc<Activity>,
 ) {
-    let Ok(_global) = inner.public_slots.clone().try_acquire_owned() else {
-        reply_close(&mut conn.inner, 503, "Service Unavailable", "relay busy\n").await;
-        return;
-    };
-    let ip_slot = {
-        let mut m = inner.public_per_ip.lock().unwrap();
-        let n = m.entry(peer.ip()).or_insert(0);
-        if *n >= MAX_PUBLIC_CONNECTIONS_PER_IP {
-            None
-        } else {
-            *n += 1;
-            Some(IpSlot {
-                inner: inner.clone(),
-                ip: peer.ip(),
-            })
-        }
-    };
-    let Some(_ip_slot) = ip_slot else {
-        reply_close(
-            &mut conn.inner,
-            503,
-            "Service Unavailable",
-            "too many connections\n",
-        )
-        .await;
-        return;
-    };
     let publish = inner.registry.read().unwrap().publishes.get(&name).cloned();
     let Some(publish) = publish else {
         reply_close(

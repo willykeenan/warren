@@ -226,7 +226,7 @@ hostile can stop your links, but cannot read or redirect them.
 | public request head | 32 KiB (larger: `431`) |
 | public TLS handshake + request head | 10 s |
 | public connection idle (no bytes either way) | 5 min |
-| public connections | 8192 total, 256 per client IP |
+| relay connections (any kind) | 16384 total, 256 per client IP |
 | enrollment failures | 5 per IP per 10 minutes |
 | relay-side outbound queue per machine | 64 MiB (a machine that stops reading is disconnected) |
 
