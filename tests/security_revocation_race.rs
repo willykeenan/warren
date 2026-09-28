@@ -166,6 +166,7 @@ async fn race_trials() {
                 .unwrap();
             let mut buf = vec![0u8; 65535];
             let hello = serde_json::to_vec(&warren::noise::Hello {
+                share: None,
                 v: 1,
                 src: name.clone(),
                 dest: "b".into(),

@@ -6,19 +6,33 @@
 //!   streams between them and terminates TLS for published names;
 //! * the **node daemon** ([`node`]), which keeps one WebSocket open to the relay,
 //!   enforces its own share policy and runs forwards;
-//! * the **CLI** ([`cli`]), which talks to the daemon over a private Unix socket.
+//! * the **CLI** ([`cli`]), which talks to the daemon over a private local
+//!   channel (a Unix socket, or a named pipe on Windows).
 //!
 //! Private streams are end-to-end encrypted with
 //! `Noise_IK_25519_ChaChaPoly_BLAKE2s` ([`noise`]); the relay only ever sees
 //! ciphertext for them. See `docs/protocol.md` for the wire format.
 
-#![forbid(unsafe_code)]
+// No `unsafe` anywhere except `sys::windows`, which wraps the Win32 security
+// and console calls that have no safe API (`tests/network_audit.rs` checks
+// that no other file uses it).
+#![deny(unsafe_code)]
 
 pub mod cli;
 pub mod crypto;
+pub mod device_enrollment;
 pub mod fsutil;
+pub mod gateway_policy;
 pub mod http;
+#[cfg(unix)]
 pub mod install;
+#[cfg(windows)]
+#[path = "install_windows.rs"]
+pub mod install;
+#[cfg(all(unix, test))]
+#[allow(dead_code)]
+#[path = "install_windows.rs"]
+mod install_windows_tests;
 pub mod limits;
 pub mod mux;
 pub mod net;
@@ -26,6 +40,7 @@ pub mod node;
 pub mod noise;
 pub mod proto;
 pub mod relay;
+pub mod sys;
 pub mod tls;
 pub mod ws;
 

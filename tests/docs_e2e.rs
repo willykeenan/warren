@@ -47,6 +47,7 @@ async fn join_force_refuses_while_the_daemon_runs() {
 
 /// A WARREN_HOME too long for a Unix socket path is refused with an
 /// explanation, by the daemon and by the CLI's control requests.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn too_long_home_is_explained() {
     let relay = start_relay().await;
@@ -118,6 +119,7 @@ async fn devices_with_a_few_hundred_enrolled_machines() {
 /// unsuccessful exit, systemd `Restart=on-failure`), so `warren down` is not
 /// undone on an installed machine.
 #[test]
+#[cfg(unix)]
 fn installed_service_does_not_undo_warren_down() {
     use warren::install::{launchd_plist, systemd_unit, Flavor, InstallOptions};
     let o = InstallOptions {

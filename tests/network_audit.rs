@@ -1,5 +1,6 @@
-//! SR9: the binary makes no network connection other than to the configured
-//! relay (and, on the relay, to its ACME directory).
+//! SR9: connections are restricted to the configured relay, local loopback
+//! services, and explicitly granted, validated gateway targets. The relay also
+//! uses its configured ACME directory.
 //!
 //! Enforced structurally: every outbound TCP connection goes through
 //! `src/net.rs` (`dial_relay` for the relay URL from the node's identity file,
@@ -24,6 +25,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Strip `#[cfg(test)] mod tests { ... }` blocks: tests may open sockets freely.
 fn non_test_source(src: &str) -> String {
+    let src = src.replace("\r\n", "\n");
     match src.find("#[cfg(test)]\nmod tests") {
         Some(i) => src[..i].to_string(),
         None => src.to_string(),
@@ -41,7 +43,7 @@ fn outbound_connections_only_in_the_dial_module() {
     let rules: &[(&str, &[&str])] = &[
         ("TcpStream::connect", &["src/net.rs"]),
         ("UdpSocket", &[]),
-        ("lookup_host", &[]),
+        ("lookup_host", &["src/net.rs"]),
         ("to_socket_addrs", &[]),
         ("ToSocketAddrs", &[]),
         ("connect_async", &[]),
@@ -49,16 +51,19 @@ fn outbound_connections_only_in_the_dial_module() {
         ("client_async", &["src/ws.rs"]),
         ("net::dial_relay", &["src/ws.rs"]),
         ("instant_acme", &["src/relay/acme.rs"]),
-        (
-            "UnixStream::connect",
-            &["src/node/control.rs", "src/node/daemon.rs"],
-        ),
+        ("UnixStream::connect", &["src/node/ipc.rs"]),
         ("reqwest", &[]),
         ("ureq", &[]),
         ("hyper", &[]),
         (
             "Command::new",
-            &["src/install.rs", "src/cli.rs", "src/node/mod.rs"],
+            &[
+                "src/install.rs",
+                "src/install_windows.rs",
+                "src/cli.rs",
+                "src/node/mod.rs",
+                "src/device_enrollment.rs", // Fixed macOS-only read-only ACL inspection; asserted below.
+            ],
         ),
     ];
     let mut violations = Vec::new();
@@ -75,16 +80,21 @@ fn outbound_connections_only_in_the_dial_module() {
             }
         }
     }
+    let enrollment =
+        non_test_source(&std::fs::read_to_string(root.join("src/device_enrollment.rs")).unwrap());
+    assert!(enrollment_acl_command_is_bounded(&enrollment));
+    assert!(enrollment.contains("#[cfg(target_os = \"macos\")]"));
     assert!(
         violations.is_empty(),
         "unexpected network code: {violations:#?}"
     );
 
-    // The dial module only dials the relay URL and loopback addresses.
+    // Gateway resolution and validated numeric dialing remain inside this module.
     let net = std::fs::read_to_string(root.join("src/net.rs")).unwrap();
     let net = non_test_source(&net);
-    assert_eq!(net.matches("TcpStream::connect(").count(), 2);
+    assert_eq!(net.matches("TcpStream::connect(").count(), 3);
     assert!(net.contains("if !addr.ip().is_loopback()"));
+    assert!(net.contains("validate_resolved(target, &addresses, &relay_addresses)"));
     // The relay URL comes only from the node's identity file (or `join --relay`).
     let daemon = std::fs::read_to_string(root.join("src/node/daemon.rs")).unwrap();
     assert!(daemon.contains("connect_relay(&self.relay, self.pin)"));
@@ -106,20 +116,21 @@ fn outbound_connections_only_in_the_dial_module() {
 fn no_network_client_dependencies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    let deps = manifest
-        .split("[dependencies]")
-        .nth(1)
-        .unwrap()
-        .split("\n[")
-        .next()
-        .unwrap();
-    let names: Vec<&str> = deps
-        .lines()
-        .filter_map(|l| l.split('=').next())
-        .map(str::trim)
-        .filter(|n| !n.is_empty() && !n.starts_with('#'))
-        .collect();
+    let mut in_deps = false;
+    let mut names = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_deps = line == "[dependencies]"
+                || (line.starts_with("[target.") && line.ends_with(".dependencies]"));
+        } else if in_deps && !line.starts_with('#') {
+            if let Some((name, _)) = line.split_once('=') {
+                names.push(name.trim());
+            }
+        }
+    }
     let allowed = [
+        "windows-sys", // Restricted Win32 ACL, pipe security and console wrapper.
         "anyhow",
         "bytes",
         "clap",
@@ -152,4 +163,61 @@ fn no_network_client_dependencies() {
         assert!(allowed.contains(n), "unreviewed dependency {n}");
     }
     assert!(names.len() >= 20);
+}
+
+#[test]
+fn windows_security_boundaries_are_explicit() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ipc = std::fs::read_to_string(root.join("src/node/ipc.rs")).unwrap();
+    for guard in [
+        "first_pipe_instance(true)",
+        "reject_remote_clients(true)",
+        "SECURITY_IDENTIFICATION",
+        "owner_sid",
+    ] {
+        assert!(ipc.contains(guard), "missing {guard}");
+    }
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    for f in files {
+        if f.ends_with("sys/windows.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&f).unwrap();
+        for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            for forbidden in ["unsafe {", "unsafe fn", "unsafe impl", "allow(unsafe_code)"] {
+                assert!(
+                    !line.contains(forbidden),
+                    "unsafe outside wrapper: {}: {line}",
+                    f.display()
+                );
+            }
+        }
+    }
+}
+
+// The exception is a read-only macOS gateway ACL inspection, never a phone or
+// network-client command. Preserve exact arguments and an empty environment.
+fn enrollment_acl_command_is_bounded(source: &str) -> bool {
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.matches("Command::new").count() == 1
+        && compact.contains(
+            r#"std::process::Command::new("/bin/ls").args(["-lde","--"]).arg(path).env_clear().env("LC_ALL","C").output().map_err(unavailable)?"#,
+        )
+}
+
+#[test]
+fn enrollment_acl_exception_rejects_network_commands_and_changed_environment() {
+    let source = non_test_source(include_str!("../src/device_enrollment.rs"));
+    assert!(enrollment_acl_command_is_bounded(&source));
+    for modified in [
+        source.replace("/bin/ls", "/usr/bin/curl"),
+        source.replace("/bin/ls", "/bin/sh"),
+        source.replace("-lde", "-l"),
+        source.replace(".env_clear()", ""),
+        source.replace("LC_ALL", "PATH"),
+        format!("{source} std::process::Command::new(\"/usr/bin/curl\");"),
+    ] {
+        assert!(!enrollment_acl_command_is_bounded(&modified));
+    }
 }

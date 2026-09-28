@@ -37,7 +37,11 @@ impl Env {
 
     fn cmd(&self, home: &str) -> Command {
         let mut c = Command::new(BIN);
+        #[cfg(windows)]
+        c.creation_flags(warren::sys::windows::CREATE_NEW_PROCESS_GROUP);
         c.env("HOME", self.p("fakehome"))
+            .env("LOCALAPPDATA", self.p("fakehome"))
+            .env("WARREN_TASK_DIR", self.p("tasks"))
             .env("WARREN_HOME", self.p(home))
             // The most verbose level: secrets must not appear even here.
             .env("WARREN_LOG", "trace")
@@ -327,6 +331,7 @@ async fn binary_end_to_end() {
     assert_eq!(o.stdout, "hello via nc\n");
     // `warren ssh` hands ssh a ProxyCommand running `warren nc`. A stand-in
     // ssh runs that ProxyCommand exactly as ssh would (via sh, %h = host).
+    #[cfg(unix)]
     {
         let bin = env.p("fakebin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -359,6 +364,54 @@ async fn binary_end_to_end() {
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(o.stdout, b"ssh bytes\n");
+    }
+    #[cfg(windows)]
+    {
+        let sink = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = sink.local_addr().unwrap().port().to_string();
+        env.ok("b", &["--json", "share", &port, "--to", "a"]).await;
+        let banner = tokio::spawn(async move {
+            let (stream, _) = sink.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        });
+        let bin_dir = env.p("my tools");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("warren.exe");
+        std::fs::copy(BIN, &exe).unwrap();
+        let mut command = Command::new(&exe);
+        command
+            .env("WARREN_HOME", env.p("a"))
+            .args([
+                "ssh",
+                "me@b",
+                "-p",
+                &port,
+                "--",
+                "-oBatchMode=yes",
+                "-oConnectTimeout=5",
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(255),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(5), banner)
+            .await
+            .unwrap()
+            .unwrap()
+            .starts_with("SSH-2.0-"));
     }
     // Unshared port: refused with the documented exit code.
     let o = env.run_stdin("a", &["nc", "b", "1"], b"x").await;
@@ -438,6 +491,7 @@ async fn binary_end_to_end() {
     // SR9 at runtime: every TCP connection the relay and daemons hold goes to
     // the relay port or to loopback services; nothing else is contacted.
     // Needs lsof; set WARREN_REQUIRE_LSOF=1 (as CI does) to fail without it.
+    #[cfg(unix)]
     for (who, pid) in [("relay", relay.id()), ("a", da.id()), ("b", db.id())] {
         let pid = pid.unwrap().to_string();
         let Ok(o) = std::process::Command::new("lsof")
@@ -471,6 +525,38 @@ async fn binary_end_to_end() {
         }
     }
 
+    #[cfg(windows)]
+    for (who, pid) in [("relay", relay.id()), ("a", da.id()), ("b", db.id())] {
+        let pid = pid.unwrap().to_string();
+        let o = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let text = String::from_utf8_lossy(&o.stdout);
+        let mut relay_seen = false;
+        for line in text.lines() {
+            let cols: Vec<_> = line.split_whitespace().collect();
+            if cols.last().copied() != Some(pid.as_str()) {
+                continue;
+            }
+            assert_ne!(cols[0], "UDP", "{who}: {line}");
+            if cols[0] == "TCP" && cols.len() >= 5 {
+                let remote = cols[2];
+                assert!(
+                    remote.starts_with("127.0.0.1:")
+                        || remote.starts_with("[::1]:")
+                        || remote == "0.0.0.0:0"
+                        || remote == "[::]:0",
+                    "{who}: {line}"
+                );
+                relay_seen |= remote == format!("127.0.0.1:{port}");
+            }
+        }
+        if who != "relay" {
+            assert!(relay_seen, "{who} has no relay connection: {text}");
+        }
+    }
     // Exit codes for common failure modes.
     let o = env.run("fresh", &["--json", "status"]).await;
     assert_eq!(o.code, 3, "not enrolled: {}", o.stdout);
@@ -486,12 +572,28 @@ async fn binary_end_to_end() {
     let path = PathBuf::from(v["path"].as_str().unwrap());
     let expected_dir = if cfg!(target_os = "macos") {
         env.p("launchd")
+    } else if cfg!(windows) {
+        env.p("tasks")
     } else {
         env.p("systemd")
     };
     assert!(path.starts_with(&expected_dir), "{}", path.display());
     assert_eq!(v["started"], false);
+    #[cfg(unix)]
     let unit = std::fs::read_to_string(&path).unwrap();
+    #[cfg(windows)]
+    let unit = {
+        let b = std::fs::read(&path).unwrap();
+        String::from_utf16(
+            &b[2..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
     assert!(
         unit.contains(BIN)
             || unit.contains(
@@ -501,7 +603,11 @@ async fn binary_end_to_end() {
                     .to_string()
             )
     );
-    assert!(unit.contains("WARREN_HOME"));
+    assert!(unit.contains(if cfg!(windows) {
+        "--home"
+    } else {
+        "WARREN_HOME"
+    }));
     env.ok("a", &["--json", "uninstall"]).await;
     assert!(!path.exists());
 
@@ -519,8 +625,13 @@ async fn binary_end_to_end() {
     assert_eq!(o.code, 4, "daemon not running: {}", o.stdout);
     let st = env.ok("a", &["--json", "status"]).await;
     assert_eq!(st["daemon"]["running"], false);
-    let pid = rustix::process::Pid::from_raw(relay.id().unwrap() as i32).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(relay.id().unwrap() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+    }
+    #[cfg(windows)]
+    warren::sys::windows::send_ctrl_break(relay.id().unwrap()).unwrap();
     let st = tokio::time::timeout(Duration::from_secs(10), relay.wait())
         .await
         .unwrap()
@@ -528,24 +639,22 @@ async fn binary_end_to_end() {
     assert!(st.success());
 
     // SR8: modes.
-    let mode = |p: &Path| warren::fsutil::mode_of(p).unwrap();
+    let private = |p: &Path| warren::fsutil::is_private(p).unwrap();
     for home in ["a", "b"] {
         let h = env.p(home);
-        assert_eq!(mode(&h), 0o700, "{home}");
+        assert!(private(&h), "{home}");
         for f in std::fs::read_dir(&h).unwrap() {
             let p = f.unwrap().path();
-            if p.is_file() {
-                assert_eq!(mode(&p), 0o600, "{}", p.display());
-            } else if p.is_dir() {
-                assert_eq!(mode(&p), 0o700, "{}", p.display());
+            if p.is_file() || p.is_dir() {
+                assert!(private(&p), "{}", p.display());
             }
         }
     }
-    assert_eq!(mode(&state), 0o700);
+    assert!(private(&state));
     for f in std::fs::read_dir(&state).unwrap() {
         let p = f.unwrap().path();
         if p.is_file() {
-            assert_eq!(mode(&p) & 0o077, 0, "{}", p.display());
+            assert!(private(&p), "{}", p.display());
         }
     }
 

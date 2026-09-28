@@ -269,7 +269,7 @@ impl NodeLink {
         if !self.opens.lock().unwrap().try_take() {
             return refuse(ErrorCode::RateLimited, "too many stream opens per second");
         }
-        if p.is_public() || p.port == 0 {
+        if !p.valid_private_selector() {
             return refuse(ErrorCode::BadRequest, "invalid OPEN");
         }
         if self.stream_count() >= MAX_STREAMS_PER_NODE {
@@ -323,7 +323,7 @@ impl NodeLink {
         };
         self.table.lock().unwrap().insert(s, Entry::Fwd(pair));
         let fwd = OpenPayload {
-            flags: 0,
+            flags: if p.is_gateway() { FLAG_GATEWAY } else { 0 },
             port: p.port,
             dest: p.dest,
             src: self.name.clone(),

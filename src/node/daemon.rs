@@ -3,6 +3,7 @@
 //! private streams, forwards, publishes and the local control socket.
 
 use super::control::{self, ControlRequest, ControlResponse};
+use super::ipc;
 use super::{
     Forward, ForwardsFile, IdentityFile, KnownPeers, NodePaths, PinCheck, Publish, PublishesFile,
     ShareDecision, SharesFile,
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -65,6 +66,15 @@ pub fn backoff_delay(attempt: u32, min: Duration, max: Duration) -> Duration {
 /// Why opening a private stream failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
+    /// A strict client operation received a malformed name or selector.
+    #[error("invalid client argument")]
+    InvalidArgument,
+    /// The exact local, explicitly approved pin does not authorize this operation.
+    #[error("peer approval rejected")]
+    PinRejected,
+    /// The local approval store cannot be read, validated or durably updated.
+    #[error("peer approval storage unavailable")]
+    StorageUnavailable,
     #[error("not connected to the relay")]
     NotConnected,
     #[error("{node}: {message} ({code})")]
@@ -90,6 +100,9 @@ pub enum OpenError {
 impl OpenError {
     pub fn code(&self) -> String {
         match self {
+            OpenError::InvalidArgument => "invalid_argument".into(),
+            OpenError::PinRejected => "pin_rejected".into(),
+            OpenError::StorageUnavailable => "storage_unavailable".into(),
             OpenError::NotConnected => "not_connected".into(),
             OpenError::Refused { code, .. } => code.name().into(),
             OpenError::KeyChanged { .. } => "key_changed".into(),
@@ -97,6 +110,18 @@ impl OpenError {
             OpenError::Handshake(..) => "handshake_failed".into(),
             OpenError::Other(_) => "error".into(),
         }
+    }
+}
+
+// Preserve local approval failures across pacing/retry without confusing them
+// with an actual remote refusal. The ordinary session API keeps its tuple shape.
+enum SessionOpenError {
+    Transport(ErrorCode, String),
+    Approval(OpenError),
+}
+impl From<(ErrorCode, String)> for SessionOpenError {
+    fn from((code, message): (ErrorCode, String)) -> Self {
+        Self::Transport(code, message)
     }
 }
 
@@ -223,11 +248,40 @@ impl Session {
         dest: &str,
         port: u16,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        self.open_mode(dest, port, 0).await
+    }
+
+    async fn open_mode(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        flags: u8,
+    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        self.open_mode_approved(dest, port, flags, None)
+            .await
+            .map_err(|error| match error {
+                SessionOpenError::Transport(code, message) => (code, message),
+                // No approval is supplied on this legacy path.
+                SessionOpenError::Approval(_) => {
+                    (ErrorCode::Forbidden, "peer approval rejected".into())
+                }
+            })
+    }
+
+    async fn open_mode_approved(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        flags: u8,
+        approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
+    ) -> Result<(MuxSender, MuxReceiver), SessionOpenError> {
         let deadline = Instant::now() + SESSION_WAIT;
         loop {
             self.pace_open().await;
-            match self.open_once(dest, port).await {
-                Err((ErrorCode::RateLimited, _)) if Instant::now() < deadline => {
+            match self.open_once(dest, port, flags, approval).await {
+                Err(SessionOpenError::Transport(ErrorCode::RateLimited, _))
+                    if Instant::now() < deadline =>
+                {
                     tokio::time::sleep(retry_jitter(20, 80)).await;
                 }
                 r => return r,
@@ -239,14 +293,28 @@ impl Session {
         self: &Arc<Self>,
         dest: &str,
         port: u16,
-    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        flags: u8,
+        approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
+    ) -> Result<(MuxSender, MuxReceiver), SessionOpenError> {
+        // Every attempt checks after pacing/retry and lock acquisition. There is
+        // no await from this check through enqueue; trust writes use this lock.
+        let approval_guard = if let Some((daemon, key, snapshot)) = approval {
+            let guard = daemon.peers_lock.lock().await;
+            daemon
+                .check_approval(dest, key, snapshot)
+                .map_err(SessionOpenError::Approval)?;
+            Some(guard)
+        } else {
+            None
+        };
         let (tx, rx, reply, id) = {
             let mut t = self.table.lock().unwrap();
             if t.len() >= MAX_STREAMS_PER_NODE {
                 return Err((
                     ErrorCode::TooManyStreams,
                     "too many streams on this node".into(),
-                ));
+                )
+                    .into());
             }
             let id = loop {
                 let id = self.next_odd.fetch_add(2, Ordering::Relaxed);
@@ -260,14 +328,19 @@ impl Session {
             (tx, rx, reply.expect("outgoing"), id)
         };
         let p = OpenPayload {
+            flags,
             port,
             dest: dest.to_string(),
             ..Default::default()
         };
         if !self.out.send(Frame::new(FrameType::Open, id, p.encode())) {
-            return Err((ErrorCode::LinkClosed, "relay connection closed".into()));
+            return Err((ErrorCode::LinkClosed, "relay connection closed".into()).into());
         }
-        mux::wait_open(reply, Duration::from_secs(15)).await?;
+        // Revocation must not wait for the relay or Noise handshake.
+        drop(approval_guard);
+        mux::wait_open(reply, Duration::from_secs(15))
+            .await
+            .map_err(SessionOpenError::from)?;
         Ok((tx, rx))
     }
 
@@ -318,6 +391,24 @@ pub struct DaemonInner {
     /// new peer asks the relay once.
     lookup_lock: tokio::sync::Mutex<()>,
     pub shutdown: CancellationToken,
+    gateway: Option<Arc<super::gateway::GatewayRuntime>>,
+    client_only: bool,
+    _home_lease: Arc<super::embedded::HomeLease>,
+    private_services: Arc<super::private_service::PrivateServices>,
+}
+
+struct AbortWriter(tokio::task::JoinHandle<()>);
+impl Drop for AbortWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+struct SessionCleanup(Arc<Session>);
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.0.out.close();
+        self.0.teardown();
+    }
 }
 
 /// A running daemon.
@@ -327,12 +418,32 @@ pub struct DaemonHandle {
 }
 
 impl DaemonHandle {
+    pub(super) fn cancel_client(&self) {
+        debug_assert!(self.inner.client_only);
+        self.inner.shutdown.cancel();
+        if let Some(session) = self.inner.session.send_replace(None) {
+            session.out.close();
+            session.teardown();
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+
     pub async fn shutdown(self) {
         self.inner.shutdown.cancel();
-        for t in self.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+        for mut t in self.tasks {
+            if tokio::time::timeout(Duration::from_secs(5), &mut t)
+                .await
+                .is_err()
+            {
+                t.abort();
+                let _ = t.await;
+            }
         }
-        let _ = std::fs::remove_file(self.inner.cfg.paths.socket());
+        if !self.inner.client_only {
+            ipc::cleanup(&self.inner.cfg.paths);
+        }
     }
 
     /// Wait until connected to the relay.
@@ -354,15 +465,49 @@ impl DaemonHandle {
 
 /// Start the daemon: control socket, forwards and the relay connection loop.
 pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
-    let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
+    start_mode(cfg, false).await
+}
+
+pub(super) async fn start_mode(cfg: DaemonConfig, client_only: bool) -> Result<DaemonHandle> {
+    let open_files = if client_only {
+        0
+    } else {
+        crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES)
+    };
     let paths = cfg.paths.clone();
-    paths.ensure()?;
+    let home_lease = Arc::new(super::embedded::HomeLease::acquire(&paths)?);
+    #[cfg(unix)]
+    crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
+    if client_only {
+        super::embedded::PublicIdentity::from_identity(&ident)?;
+    }
     let id = ident.identity()?;
     let relay = ident.relay_url()?;
     let pin = ident.pin()?;
-    let publishes = PublishesFile::load(&paths)?.publishes;
+    let publishes = if client_only {
+        Vec::new()
+    } else {
+        PublishesFile::load(&paths)?.publishes
+    };
+    let forwards = if client_only {
+        Vec::new()
+    } else {
+        ForwardsFile::load(&paths)?.forwards
+    };
     let (session_tx, _) = watch::channel(None);
+    let gateway = if client_only {
+        None
+    } else {
+        Some(super::gateway::GatewayRuntime::new(
+            paths.clone(),
+            id.clone(),
+            ident.name.clone(),
+            relay.clone(),
+        )?)
+    };
+    let private_services =
+        super::private_service::PrivateServices::new(paths.clone(), id.clone(), ident.name.clone());
     let inner = Arc::new(DaemonInner {
         cfg,
         ident,
@@ -382,28 +527,44 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         peers_lock: tokio::sync::Mutex::new(()),
         lookup_lock: tokio::sync::Mutex::new(()),
         shutdown: CancellationToken::new(),
+        gateway,
+        client_only,
+        _home_lease: home_lease,
+        private_services,
     });
 
-    let listener = bind_control(&paths).await?;
     let mut tasks = Vec::new();
-    {
-        let d = inner.clone();
-        tasks.push(tokio::spawn(async move { d.serve_control(listener).await }));
-    }
-    for f in ForwardsFile::load(&paths)?.forwards {
-        if let Err(e) = inner.start_forward(f.clone()) {
-            inner.record_error(format!(
-                "forward {} -> {}:{}: {e:#}",
-                f.local, f.node, f.port
-            ));
-            inner.forwards.lock().unwrap().insert(
-                f.local,
-                ForwardState {
-                    fwd: f,
-                    task: None,
-                    error: Some(format!("{e:#}")),
-                },
-            );
+    if !client_only {
+        let listener = ipc::bind(&paths).await?;
+        {
+            let services = inner.private_services.clone();
+            let stop = inner.shutdown.clone();
+            tasks.push(tokio::spawn(async move { services.watch(stop).await }));
+        }
+        {
+            let g = inner.gateway.as_ref().expect("desktop gateway").clone();
+            let stop = inner.shutdown.clone();
+            tasks.push(tokio::spawn(async move { g.watch(stop).await }));
+        }
+        {
+            let d = inner.clone();
+            tasks.push(tokio::spawn(async move { d.serve_control(listener).await }));
+        }
+        for f in forwards {
+            if let Err(e) = inner.start_forward(f.clone()) {
+                inner.record_error(format!(
+                    "forward {} -> {}:{}: {e:#}",
+                    f.local, f.node, f.port
+                ));
+                inner.forwards.lock().unwrap().insert(
+                    f.local,
+                    ForwardState {
+                        fwd: f,
+                        task: None,
+                        error: Some(format!("{e:#}")),
+                    },
+                );
+            }
         }
     }
     {
@@ -414,21 +575,43 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
     Ok(DaemonHandle { inner, tasks })
 }
 
-async fn bind_control(paths: &NodePaths) -> Result<UnixListener> {
-    let sock = paths.checked_socket()?;
-    if sock.exists() {
-        if UnixStream::connect(&sock).await.is_ok() {
-            anyhow::bail!("warren is already running for {}", paths.home.display());
-        }
-        let _ = std::fs::remove_file(&sock);
-    }
-    let l = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
-}
-
 impl DaemonInner {
+    fn gateway(&self) -> &Arc<super::gateway::GatewayRuntime> {
+        self.gateway
+            .as_ref()
+            .expect("gateway exists only for desktop daemon")
+    }
+    /// Install an in-process service for a previously explicitly trusted exact peer key.
+    pub async fn register_private_service(
+        &self,
+        port: u16,
+        peer: &str,
+        expected_key: [u8; 32],
+        handler: Arc<dyn super::private_service::PrivateServiceHandler>,
+    ) -> Result<super::private_service::ServiceRegistration> {
+        let _guard = self.private_services.mutation.lock().await;
+        if self.shutdown.is_cancelled()
+            || self
+                .publishes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.port == port)
+        {
+            anyhow::bail!("private service unavailable or port publicly published");
+        }
+        self.private_services
+            .register(port, peer, expected_key, handler)
+    }
+
+    /// Return only after pending handshakes and active handlers have dropped their streams.
+    pub async fn revoke_private_service(
+        &self,
+        registration: &super::private_service::ServiceRegistration,
+    ) -> Result<()> {
+        self.private_services.revoke(registration).await
+    }
+
     pub fn current(&self) -> Option<Arc<Session>> {
         self.session.borrow().clone()
     }
@@ -483,7 +666,12 @@ impl DaemonInner {
             }
             self.set_state("connecting");
             let started = Instant::now();
-            match self.connect_once().await {
+            let connected = if self.client_only {
+                tokio::select! { biased; _ = self.shutdown.cancelled() => break, result = self.connect_once() => result }
+            } else {
+                self.connect_once().await
+            };
+            match connected {
                 Ok(reason) => {
                     tracing::info!("relay connection ended: {reason}");
                     if started.elapsed() > Duration::from_secs(30) {
@@ -513,6 +701,9 @@ impl DaemonInner {
             _ = self.shutdown.cancelled() => return Ok("shutting down"),
             r = crate::ws::connect_relay(&self.relay, self.pin) => r?,
         };
+        if let Some(gateway) = &self.gateway {
+            gateway.relay_connected(ws.get_ref().get_ref().0.peer_addr()?.ip());
+        }
         let challenge = super::read_challenge(&mut ws).await?;
         let hello = NodeHello::Auth {
             version: PROTOCOL_VERSION,
@@ -547,7 +738,8 @@ impl DaemonInner {
             connected_at: crate::now_secs(),
         });
         let (sink, mut stream) = ws.split();
-        let writer = tokio::spawn(mux::run_writer(sink, rx, out.clone(), None));
+        let mut writer = AbortWriter(tokio::spawn(mux::run_writer(sink, rx, out.clone(), None)));
+        let _session_cleanup = SessionCleanup(session.clone());
         {
             let mut s = self.status.lock().unwrap();
             s.connects += 1;
@@ -555,7 +747,7 @@ impl DaemonInner {
         self.set_state("connected");
         self.session.send_replace(Some(session.clone()));
         tracing::info!(relay = %self.relay.https(), "connected to relay");
-        {
+        if !self.client_only {
             let d = self.clone();
             let s = session.clone();
             tokio::spawn(async move { d.reclaim_publishes(&s).await });
@@ -593,7 +785,13 @@ impl DaemonInner {
         out.close();
         self.session.send_replace(None);
         session.teardown();
-        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        if tokio::time::timeout(Duration::from_secs(2), &mut writer.0)
+            .await
+            .is_err()
+        {
+            writer.0.abort();
+            let _ = (&mut writer.0).await;
+        }
         Ok(reason)
     }
 
@@ -644,6 +842,14 @@ impl DaemonInner {
     }
 
     fn incoming(self: &Arc<Self>, session: &Arc<Session>, f: Frame) {
+        if self.client_only {
+            session.out.send(Frame::open_err(
+                f.stream,
+                ErrorCode::Forbidden,
+                "embedded client refuses inbound streams",
+            ));
+            return;
+        }
         let id = f.stream;
         let Ok(p) = OpenPayload::decode(&f.payload) else {
             session
@@ -651,6 +857,14 @@ impl DaemonInner {
                 .send(Frame::open_err(id, ErrorCode::BadRequest, "malformed OPEN"));
             return;
         };
+        if !(p.valid_private_selector() || (p.flags == FLAG_PUBLIC && p.port == 0)) {
+            session.out.send(Frame::open_err(
+                id,
+                ErrorCode::BadRequest,
+                "unsupported selector",
+            ));
+            return;
+        }
         let (tx, rx) = {
             let mut t = session.table.lock().unwrap();
             if t.contains_key(&id) {
@@ -670,6 +884,14 @@ impl DaemonInner {
             t.insert(id, slot);
             (tx, rx)
         };
+        if p.is_gateway() {
+            self.gateway().spawn(p, tx, rx);
+            return;
+        }
+        if !p.is_public() && self.private_services.reserved(p.port) {
+            self.private_services.spawn(p, tx, rx);
+            return;
+        }
         let d = self.clone();
         tokio::spawn(async move {
             if p.is_public() {
@@ -767,7 +989,13 @@ impl DaemonInner {
             return;
         }
         let h = &responder.hello;
-        if h.dest != self.ident.name || h.port != p.port || h.src != p.src {
+        if h.v != 1
+            || h.share.is_some()
+            || h.dest != self.ident.name
+            || h.port != p.port
+            || h.src != p.src
+            || p.dest != self.ident.name
+        {
             self.record_error(format!(
                 "refused connection from {}: request does not match the relay's OPEN",
                 p.src
@@ -930,13 +1158,214 @@ impl DaemonInner {
         dest: &str,
         port: u16,
     ) -> Result<SecureChannel, OpenError> {
+        self.open_selected(dest, port, None).await
+    }
+
+    /// Open using an exact, explicitly trusted local pin and no relay key lookup.
+    /// Approval is checked again after the handshake; this is not a lifetime
+    /// revocation subscription. See `docs/PINNED-CLIENT.md`.
+    pub async fn open_private_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected_pinned(dest, port, None, expected_key)
+            .await
+    }
+
+    /// Explicit local-owner approval of a previously verified full key.
+    /// Never looks up a key, replaces a different key, or repairs unreadable pins.
+    /// This grants future opens only; it does not authenticate the user's UI action.
+    pub async fn approve_peer_key(&self, name: &str, key: &[u8; 32]) -> Result<(), OpenError> {
+        if !crate::valid_name(name) {
+            return Err(OpenError::InvalidArgument);
+        }
+        let _guard = self.peers_lock.lock().await;
+        let mut pins =
+            KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
+        if pins.relay.is_empty() && pins.peers.is_empty() {
+            pins.relay = self.ident.relay.clone();
+        }
+        if pins.relay != self.ident.relay {
+            return Err(OpenError::PinRejected);
+        }
+        match pins.check(name, key) {
+            PinCheck::Changed { .. } => {
+                return Err(OpenError::PinRejected);
+            }
+            PinCheck::Match => {
+                let record = pins.peers.get_mut(name).expect("matched pin exists");
+                if record.trusted_at.is_some() {
+                    return Ok(());
+                }
+                record.trusted_at = Some(crate::now_secs());
+            }
+            PinCheck::New => pins.pin(name, key, true),
+        }
+        pins.save(&self.cfg.paths)
+            .map_err(|_| OpenError::StorageUnavailable)
+    }
+
+    /// Forget only the exact key the local owner intended to revoke.
+    /// Existing channels are not closed by this operation: the embedding must
+    /// drain them before acknowledging a complete disconnect.
+    pub async fn forget_peer_key(&self, name: &str, expected: &[u8; 32]) -> Result<(), OpenError> {
+        if !crate::valid_name(name) {
+            return Err(OpenError::InvalidArgument);
+        }
+        let _guard = self.peers_lock.lock().await;
+        let mut pins =
+            KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
+        if pins.relay != self.ident.relay || !matches!(pins.check(name, expected), PinCheck::Match)
+        {
+            return Err(OpenError::PinRejected);
+        }
+        pins.peers.remove(name);
+        pins.save(&self.cfg.paths)
+            .map_err(|_| OpenError::StorageUnavailable)
+    }
+
+    /// Open an encrypted named share with the same explicit approval boundary.
+    /// No ordinary-port fallback or relay key lookup is permitted.
+    pub async fn open_gateway_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        share: &str,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected_pinned(dest, 0, Some(share.to_string()), expected_key)
+            .await
+    }
+
+    async fn open_selected_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        share: Option<String>,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        if !crate::valid_name(dest)
+            || share.as_ref().is_some_and(|s| !crate::valid_name(s))
+            || (share.is_some() != (port == 0))
+        {
+            return Err(OpenError::InvalidArgument);
+        }
+        let approval = {
+            let _g = self.peers_lock.lock().await;
+            self.approved_peer(dest, expected_key)?
+        };
+        let session = self
+            .wait_session(SESSION_WAIT)
+            .await
+            .ok_or(OpenError::NotConnected)?;
+        let (tx, rx) = session
+            .open_mode_approved(
+                dest,
+                port,
+                if share.is_some() { FLAG_GATEWAY } else { 0 },
+                Some((self, expected_key, &approval)),
+            )
+            .await
+            .map_err(|error| match error {
+                SessionOpenError::Approval(error) => error,
+                SessionOpenError::Transport(code, message) => OpenError::Refused {
+                    code,
+                    node: dest.to_string(),
+                    message,
+                },
+            })?;
+        {
+            let _g = self.peers_lock.lock().await;
+            if let Err(error) = self.check_approval(dest, expected_key, &approval) {
+                tx.reset(ErrorCode::Forbidden);
+                return Err(error);
+            }
+        }
+        let hello = Hello {
+            share,
+            v: 1,
+            src: self.ident.name.clone(),
+            dest: dest.to_string(),
+            port,
+        };
+        let channel = noise::initiate(tx, rx, &self.id, expected_key, &hello)
+            .await
+            .map_err(|e| match e {
+                noise::NoiseError::Refused(code) => OpenError::Refused {
+                    code,
+                    node: dest.to_string(),
+                    message: "the destination refused the stream".into(),
+                },
+                e => OpenError::Handshake(dest.to_string(), e.to_string()),
+            })?;
+        let _g = self.peers_lock.lock().await;
+        let still_approved = self.approved_peer(dest, expected_key);
+        match still_approved {
+            Ok(current) if current == approval => Ok(channel),
+            other => {
+                channel.tx.reset(ErrorCode::Forbidden);
+                Err(other.err().unwrap_or(OpenError::PinRejected))
+            }
+        }
+    }
+
+    fn check_approval(
+        &self,
+        dest: &str,
+        key: &[u8; 32],
+        snapshot: &super::KnownPeer,
+    ) -> Result<(), OpenError> {
+        if self.approved_peer(dest, key)? != *snapshot {
+            return Err(OpenError::PinRejected);
+        }
+        Ok(())
+    }
+
+    /// Read-only approval check, called while holding `peers_lock`.
+    fn approved_peer(
+        &self,
+        name: &str,
+        expected_key: &[u8; 32],
+    ) -> Result<super::KnownPeer, OpenError> {
+        let pins = KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
+        let record = pins.peers.get(name).filter(|record| {
+            pins.relay == self.ident.relay
+                && record.trusted_at.is_some()
+                && pins
+                    .pinned(name)
+                    .is_some_and(|key| crypto::ct_eq(&key, expected_key))
+        });
+        record.cloned().ok_or(OpenError::PinRejected)
+    }
+
+    pub async fn open_gateway(
+        self: &Arc<Self>,
+        dest: &str,
+        share: &str,
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected(dest, 0, Some(share.to_string())).await
+    }
+
+    async fn open_selected(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        share: Option<String>,
+    ) -> Result<SecureChannel, OpenError> {
+        if !crate::valid_name(dest)
+            || (share.as_ref().is_some_and(|s| !crate::valid_name(s)))
+            || (share.is_some() != (port == 0))
+        {
+            return Err(OpenError::Other("invalid selector".into()));
+        }
         let session = self
             .wait_session(SESSION_WAIT)
             .await
             .ok_or(OpenError::NotConnected)?;
         let key = self.peer_key(&session, dest).await?;
         let (tx, rx) = session
-            .open(dest, port)
+            .open_mode(dest, port, if share.is_some() { FLAG_GATEWAY } else { 0 })
             .await
             .map_err(|(code, message)| match code {
                 ErrorCode::NoSuchNode => OpenError::NoSuchNode(dest.to_string()),
@@ -947,6 +1376,7 @@ impl DaemonInner {
                 },
             })?;
         let hello = Hello {
+            share,
             v: 1,
             src: self.ident.name.clone(),
             dest: dest.to_string(),
@@ -1056,7 +1486,7 @@ impl DaemonInner {
             let d = self.clone();
             let f = f.clone();
             tokio::spawn(async move {
-                match d.open_private(&f.node, f.port).await {
+                match d.open_selected(&f.node, f.port, f.share.clone()).await {
                     Ok(chan) => {
                         let (r, w) = tcp.into_split();
                         let _ = chan.pipe(r, w).await;
@@ -1078,13 +1508,17 @@ impl DaemonInner {
             .unwrap()
             .values()
             .map(|f| {
-                json!({
+                let mut status = json!({
                     "local": f.fwd.local,
                     "node": f.fwd.node,
                     "port": f.fwd.port,
                     "listening": f.task.is_some(),
                     "error": f.error,
-                })
+                });
+                if let Some(name) = &f.fwd.share {
+                    status["share"] = json!(name);
+                }
+                status
             })
             .collect();
         let publishes: Vec<Value> = self
@@ -1096,6 +1530,7 @@ impl DaemonInner {
             .collect();
         let errors: Vec<ErrorEntry> = self.errors.lock().unwrap().iter().cloned().collect();
         let session = self.current();
+        let gateways = self.gateway().status();
         json!({
             "node": {
                 "name": self.ident.name,
@@ -1112,15 +1547,86 @@ impl DaemonInner {
             },
             "daemon": { "running": true, "pid": std::process::id() },
             "shares": shares.shares,
+            "gateway_audit": self.gateway().audit_health(),
+            "gateway_count": gateways.len(),
+            "gateways": gateways,
             "forwards": forwards,
             "publishes": publishes,
             "recent_errors": errors,
         })
     }
 
+    async fn add_forward(self: &Arc<Self>, f: Forward) -> ControlResponse {
+        let local = f.local;
+        // Replacing a forward on the same port: stop the old listener first.
+        let old = self.forwards.lock().unwrap().remove(&local);
+        if let Some(ForwardState { task: Some(t), .. }) = old {
+            t.abort();
+            let _ = t.await;
+        }
+        if let Err(e) = self.start_forward(f.clone()) {
+            return ControlResponse::err("bind_failed", format!("{e:#}"));
+        }
+        let mut file = ForwardsFile::load(&self.cfg.paths).unwrap_or_default();
+        file.forwards.retain(|x| x.local != local);
+        file.forwards.push(f.clone());
+        file.forwards.sort_by_key(|x| x.local);
+        if let Err(e) = file.save(&self.cfg.paths) {
+            return ControlResponse::err("io", format!("{e:#}"));
+        }
+        ControlResponse::ok(serde_json::to_value(f).unwrap_or_default())
+    }
+
     async fn handle_request(self: &Arc<Self>, req: ControlRequest) -> ControlResponse {
         match req {
             ControlRequest::Status => ControlResponse::ok(self.status_json()),
+            ControlRequest::ShareSet { port, to } => {
+                let _guard = self.private_services.mutation.lock().await;
+                if self.private_services.reserved(port) {
+                    return ControlResponse::err(
+                        "service_reserved",
+                        "port is reserved for an in-process private service",
+                    );
+                }
+                match self.gateway().mutate_local(port, to, false).await {
+                    Ok(_) => ControlResponse::ok(json!({"port":port})),
+                    Err(e) => ControlResponse::err("share_policy", e.to_string()),
+                }
+            }
+            ControlRequest::ShareRemove { port } => {
+                match self.gateway().mutate_local(port, None, true).await {
+                    Ok(removed) => ControlResponse::ok(json!({"port":port,"removed":removed})),
+                    Err(e) => ControlResponse::err("share_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewaySet { name, target, to } => {
+                match self
+                    .gateway()
+                    .mutate(Some((name.clone(), target, to)), &name)
+                    .await
+                {
+                    Ok(()) => ControlResponse::ok(json!({"name":name})),
+                    Err(e) => ControlResponse::err("gateway_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewayRemove { name } => {
+                match self.gateway().mutate(None, &name).await {
+                    Ok(()) => ControlResponse::ok(json!({"name":name,"removed":true})),
+                    Err(e) => ControlResponse::err("gateway_policy", e.to_string()),
+                }
+            }
+            ControlRequest::GatewayForwardAdd { local, node, share } => {
+                if !crate::valid_name(&node) || !crate::valid_name(&share) || local == 0 {
+                    return ControlResponse::err("bad_request", "invalid forward");
+                }
+                self.add_forward(Forward {
+                    local,
+                    node,
+                    port: 0,
+                    share: Some(share),
+                })
+                .await
+            }
             ControlRequest::Shutdown => {
                 self.shutdown.cancel();
                 ControlResponse::ok(json!({"stopping": true}))
@@ -1129,24 +1635,13 @@ impl DaemonInner {
                 if !crate::valid_name(&node) || port == 0 || local == 0 {
                     return ControlResponse::err("bad_request", "invalid forward");
                 }
-                let f = Forward { local, node, port };
-                // Replacing a forward on the same port: stop the old listener first.
-                let old = self.forwards.lock().unwrap().remove(&local);
-                if let Some(ForwardState { task: Some(t), .. }) = old {
-                    t.abort();
-                    let _ = t.await;
-                }
-                if let Err(e) = self.start_forward(f.clone()) {
-                    return ControlResponse::err("bind_failed", format!("{e:#}"));
-                }
-                let mut file = ForwardsFile::load(&self.cfg.paths).unwrap_or_default();
-                file.forwards.retain(|x| x.local != local);
-                file.forwards.push(f.clone());
-                file.forwards.sort_by_key(|x| x.local);
-                if let Err(e) = file.save(&self.cfg.paths) {
-                    return ControlResponse::err("io", format!("{e:#}"));
-                }
-                ControlResponse::ok(serde_json::to_value(f).unwrap_or_default())
+                self.add_forward(Forward {
+                    local,
+                    node,
+                    port,
+                    share: None,
+                })
+                .await
             }
             ControlRequest::ForwardRemove { local } => {
                 let removed = self.forwards.lock().unwrap().remove(&local);
@@ -1174,6 +1669,13 @@ impl DaemonInner {
                 replace,
                 allow,
             } => {
+                let _guard = self.private_services.mutation.lock().await;
+                if self.private_services.reserved(port) {
+                    return ControlResponse::err(
+                        "service_reserved",
+                        "port is reserved for an in-process private service",
+                    );
+                }
                 let Some(session) = self.wait_session(SESSION_WAIT).await else {
                     return ControlResponse::err("not_connected", "not connected to the relay");
                 };
@@ -1377,13 +1879,15 @@ impl DaemonInner {
                     "changed": previous_fp.as_deref() != Some(current.as_str()),
                 }))
             }
-            ControlRequest::Open { .. } => ControlResponse::err("bad_request", "unexpected open"),
+            ControlRequest::Open { .. } | ControlRequest::GatewayOpen { .. } => {
+                ControlResponse::err("bad_request", "unexpected open")
+            }
         }
     }
 
-    async fn serve_control(self: Arc<Self>, l: UnixListener) {
+    async fn serve_control(self: Arc<Self>, mut l: ipc::Listener) {
         loop {
-            let (s, _) = tokio::select! {
+            let s = tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 r = l.accept() => match crate::net::accepted(r, "control socket").await {
                     Some(x) => x,
@@ -1393,11 +1897,11 @@ impl DaemonInner {
             let d = self.clone();
             tokio::spawn(async move { d.control_conn(s).await });
         }
-        let _ = std::fs::remove_file(self.cfg.paths.socket());
+        ipc::cleanup(&self.cfg.paths);
     }
 
-    async fn control_conn(self: Arc<Self>, s: UnixStream) {
-        let (r, mut w) = s.into_split();
+    async fn control_conn(self: Arc<Self>, s: ipc::Server) {
+        let (r, mut w) = tokio::io::split(s);
         let mut r = tokio::io::BufReader::new(r);
         let line =
             match tokio::time::timeout(Duration::from_secs(10), control::read_line(&mut r)).await {
@@ -1415,8 +1919,19 @@ impl DaemonInner {
                 return;
             }
         };
-        if let ControlRequest::Open { node, port } = req {
-            match self.open_private(&node, port).await {
+        let open = match &req {
+            ControlRequest::Open { node, port, framed } => {
+                Some((node.clone(), *port, None, *framed))
+            }
+            ControlRequest::GatewayOpen {
+                node,
+                share,
+                framed,
+            } => Some((node.clone(), 0, Some(share.clone()), *framed)),
+            _ => None,
+        };
+        if let Some((node, port, share, framed)) = open {
+            match self.open_selected(&node, port, share).await {
                 Ok(chan) => {
                     if write_resp(
                         &mut w,
@@ -1427,7 +1942,16 @@ impl DaemonInner {
                     {
                         return;
                     }
-                    let _ = chan.pipe(r, w).await;
+                    if framed {
+                        let _ = chan
+                            .pipe(
+                                super::framed::FramedRead::new(r),
+                                super::framed::FramedWrite::new(w),
+                            )
+                            .await;
+                    } else {
+                        let _ = chan.pipe(r, w).await;
+                    }
                 }
                 Err(e) => {
                     let _ =
@@ -1484,22 +2008,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let h = start(cfg).await?;
     let token = h.inner.shutdown.clone();
     tokio::spawn(async move {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-            _ = token.cancelled() => {}
-        }
+        let Ok(signal) = crate::sys::shutdown_signal() else {
+            return;
+        };
+        tokio::select! { _ = signal => {}, _ = token.cancelled() => {} }
         token.cancel();
     });
     let paths = h.inner.cfg.paths.clone();
     h.inner.shutdown.cancelled().await;
     h.wait().await;
-    let _ = std::fs::remove_file(paths.socket());
+    ipc::cleanup(&paths);
     tracing::info!("warren node stopped");
     Ok(())
 }
@@ -1521,6 +2039,202 @@ mod tests {
             assert!(d20 >= Duration::from_secs(30) && d20 <= Duration::from_secs(60));
             let big = backoff_delay(u32::MAX, min, max);
             assert!(big <= max);
+        }
+    }
+
+    // Real loopback relay fixture kept private to this unit-test module. It can
+    // control the existing pacer without exporting any runtime test API.
+    #[derive(Default)]
+    struct OpenObservation {
+        opens: usize,
+        data: usize,
+        reply: Option<ErrorCode>,
+        corrupt_store: bool,
+        paths: Option<NodePaths>,
+        relay: Option<Arc<crate::relay::RelayInner>>,
+    }
+
+    async fn pinned_fixture(
+        state: Arc<Mutex<OpenObservation>>,
+    ) -> (
+        tempfile::TempDir,
+        crate::relay::RelayHandle,
+        DaemonHandle,
+        [u8; 32],
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::relay::RelayConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+            temp.path().join("relay"),
+            crate::relay::TlsMode::SelfSigned,
+        );
+        let observed = state.clone();
+        cfg.tap = Some(Arc::new(move |direction, bytes| {
+            if !matches!(direction, mux::TapDir::In) {
+                return;
+            }
+            let frame = Frame::decode(bytes.to_vec().into()).unwrap();
+            let mut seen = observed.lock().unwrap();
+            if frame.ty == FrameType::Data {
+                seen.data += 1;
+            }
+            if frame.ty != FrameType::Open {
+                return;
+            }
+            seen.opens += 1;
+            if let Some(reply) = seen.reply.take() {
+                // Inject the relay response before its normal offline response.
+                // The client still reads it from the real TLS/WebSocket link.
+                let relay = seen.relay.as_ref().unwrap();
+                let online = relay.online.lock().unwrap();
+                let link = online.values().next().unwrap();
+                if reply == ErrorCode::RateLimited {
+                    assert!(link
+                        .out
+                        .send(Frame::open_err(frame.stream, reply, "fixture pacing")));
+                } else {
+                    assert!(link.out.send(Frame::open_ok(frame.stream)));
+                }
+                let paths = seen.paths.as_ref().unwrap();
+                if seen.corrupt_store {
+                    std::fs::write(paths.known_peers(), b"{").unwrap();
+                } else {
+                    let mut pins = KnownPeers::load(paths).unwrap();
+                    pins.peers.remove("b");
+                    pins.save(paths).unwrap();
+                }
+            }
+        }));
+        let relay = crate::relay::start(cfg).await.unwrap();
+        let url = format!("https://127.0.0.1:{}", relay.addr.port());
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let p = NodePaths::new(temp.path().join(name));
+            let invite = relay
+                .inner
+                .db
+                .create_invite(None, Duration::from_secs(60), crate::now_secs())
+                .unwrap();
+            crate::node::join(&p, &invite, &url, Some(name), relay.cert_sha256, false)
+                .await
+                .unwrap();
+            paths.push(p);
+        }
+        let key = IdentityFile::load(&paths[1])
+            .unwrap()
+            .identity()
+            .unwrap()
+            .static_pub;
+        let daemon = start(DaemonConfig::new(paths[0].clone())).await.unwrap();
+        assert!(daemon.wait_connected(Duration::from_secs(5)).await);
+        let mut pins = KnownPeers::load(&paths[0]).unwrap();
+        pins.relay = daemon.inner.ident.relay.clone();
+        pins.pin("b", &key, true);
+        pins.save(&paths[0]).unwrap();
+        {
+            let mut seen = state.lock().unwrap();
+            seen.paths = Some(paths[0].clone());
+            seen.relay = Some(relay.inner.clone());
+        }
+        (temp, relay, daemon, key)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn pinned_approval_removed_during_pacing_emits_zero_open() {
+        use std::{future::Future, task::Poll};
+        for corrupt_store in [false, true] {
+            for share in [None, Some("camera".to_string())] {
+                let observed = Arc::new(Mutex::new(OpenObservation::default()));
+                let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+                {
+                    let session = daemon.inner.current().unwrap();
+                    let mut bucket = session.opens.lock().unwrap();
+                    *bucket = TokenBucket::new(1, 1);
+                    assert!(bucket.take_or_wait().is_ok());
+                }
+                let port = if share.is_some() { 0 } else { 49100 };
+                let mut opening =
+                    Box::pin(daemon.inner.open_selected_pinned("b", port, share, &key));
+                std::future::poll_fn(|cx| {
+                    assert!(matches!(opening.as_mut().poll(cx), Poll::Pending));
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(observed.lock().unwrap().opens, 0);
+                if corrupt_store {
+                    std::fs::write(daemon.inner.cfg.paths.known_peers(), b"{").unwrap();
+                } else {
+                    let mut pins = KnownPeers::load(&daemon.inner.cfg.paths).unwrap();
+                    pins.peers.remove("b");
+                    pins.save(&daemon.inner.cfg.paths).unwrap();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(3), opening)
+                    .await
+                    .unwrap()
+                    .err()
+                    .expect("guard must fail");
+                assert!(
+                    matches!(
+                        (&error, corrupt_store),
+                        (OpenError::PinRejected, false) | (OpenError::StorageUnavailable, true)
+                    ),
+                    "{error}"
+                );
+                assert_eq!(
+                    observed.lock().unwrap().opens,
+                    0,
+                    "no OPEN after pacing-time revoke"
+                );
+                daemon.shutdown().await;
+                relay.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn pinned_retry_and_ack_recheck_approval_before_more_traffic() {
+        for corrupt_store in [false, true] {
+            for reply in [ErrorCode::RateLimited, ErrorCode::Forbidden] {
+                for share in [None, Some("camera".to_string())] {
+                    let observed = Arc::new(Mutex::new(OpenObservation::default()));
+                    let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+                    {
+                        let mut seen = observed.lock().unwrap();
+                        seen.reply = Some(reply);
+                        seen.corrupt_store = corrupt_store;
+                    }
+                    let port = if share.is_some() { 0 } else { 49100 };
+                    let error = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        daemon.inner.open_selected_pinned("b", port, share, &key),
+                    )
+                    .await
+                    .unwrap()
+                    .err()
+                    .expect("revoked approval must fail");
+                    assert!(
+                        matches!(
+                            (&error, corrupt_store),
+                            (OpenError::PinRejected, false) | (OpenError::StorageUnavailable, true)
+                        ),
+                        "guard must retain typed error after retry/OPEN_OK: {error}"
+                    );
+                    {
+                        let seen = observed.lock().unwrap();
+                        assert_eq!(
+                            seen.opens, 1,
+                            "no second OPEN after RateLimited-time revoke"
+                        );
+                        assert_eq!(
+                            seen.data, 0,
+                            "no Noise data after OPEN acknowledgement-time revoke"
+                        );
+                    }
+                    daemon.shutdown().await;
+                    relay.shutdown().await;
+                }
+            }
         }
     }
 }

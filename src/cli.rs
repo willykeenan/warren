@@ -58,6 +58,12 @@ pub struct Cli {
     /// Machine-readable JSON output.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Node home (overrides WARREN_HOME).
+    #[arg(long, global = true)]
+    pub home: Option<PathBuf>,
+    /// Detach the Windows console when running the login task.
+    #[arg(long, global = true, hide = true)]
+    pub background: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -89,26 +95,44 @@ pub enum Command {
     Down,
     /// Show connection state, latency, shares, forwards, publishes and recent errors.
     Status,
-    /// Share a local port with other machines (no PORT: list shares).
+    /// Share a local port or named LAN gateway (no arguments: list shares).
     Share {
+        #[arg(conflicts_with_all = ["target", "name"])]
         port: Option<u16>,
+        #[arg(long, requires = "name")]
+        target: Option<String>,
+        #[arg(long, requires = "target")]
+        name: Option<String>,
         /// Only these nodes may connect (comma-separated).
         #[arg(long, value_delimiter = ',')]
         to: Option<Vec<String>>,
     },
-    /// Stop sharing a port.
-    Unshare { port: u16 },
-    /// Forward a local port to NODE:PORT (no arguments: list forwards).
+    /// Stop sharing a local port or named LAN gateway.
+    Unshare {
+        #[arg(required_unless_present = "name", conflicts_with = "name")]
+        port: Option<u16>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Forward a local port to NODE:PORT or NODE --share NAME.
     Forward {
         local: Option<u16>,
         #[arg(value_name = "NODE:PORT")]
         target: Option<String>,
+        #[arg(long, requires_all = ["local", "target"])]
+        share: Option<String>,
         /// Remove the forward on this local port.
-        #[arg(long, value_name = "LOCAL", conflicts_with_all = ["local", "target"])]
+        #[arg(long, value_name = "LOCAL", conflicts_with_all = ["local", "target", "share"])]
         remove: Option<u16>,
     },
-    /// Connect stdin/stdout to NODE:PORT (usable as an ssh ProxyCommand).
-    Nc { node: String, port: u16 },
+    /// Connect stdin/stdout to NODE PORT or NODE --share NAME.
+    Nc {
+        node: String,
+        #[arg(required_unless_present = "share", conflicts_with = "share")]
+        port: Option<u16>,
+        #[arg(long)]
+        share: Option<String>,
+    },
     /// ssh to a node through warren.
     Ssh {
         /// [USER@]NODE
@@ -289,6 +313,9 @@ impl From<ControlError> for CliError {
             ControlError::SocketPath(_) => {
                 CliError::new(exit::ERROR, "home_too_long", e.to_string())
             }
+            ControlError::Untrusted => {
+                CliError::new(exit::ERROR, "untrusted_control_pipe", e.to_string())
+            }
             _ => CliError::new(exit::ERROR, "control", e.to_string()),
         }
     }
@@ -370,6 +397,24 @@ fn init_logging(default: &str) {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
+
+#[cfg(windows)]
+fn init_background_logging(paths: &NodePaths) -> Result<(), CliError> {
+    paths.ensure()?;
+    crate::fsutil::ensure_private_dir(&paths.logs())?;
+    let path = paths.logs().join("warren.log");
+    let file = crate::fsutil::open_private_append(&path)?;
+    let spec = std::env::var("WARREN_LOG").ok();
+    let filter = tracing_subscriber::EnvFilter::try_new(log_directives(spec.as_deref(), "info"))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_directives(None, "info")));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
+    Ok(())
 }
 
 /// Escape control characters (other than newlines and tabs) before text
@@ -461,15 +506,23 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Relay(r) => relay_cmd(r, &out).await,
         Command::Up => {
+            let paths = NodePaths::resolve(cli.home.as_deref())?;
+            #[cfg(unix)]
             init_logging("info");
-            let paths = NodePaths::from_env()?;
+            #[cfg(windows)]
+            if cli.background {
+                init_background_logging(&paths)?;
+                crate::sys::windows::free_console();
+            } else {
+                init_logging("info");
+            }
             IdentityFile::load(&paths)?;
             daemon::run(DaemonConfig::new(paths)).await?;
             Ok(())
         }
         other => {
             init_logging("warn");
-            let paths = NodePaths::from_env()?;
+            let paths = NodePaths::resolve(cli.home.as_deref())?;
             node_cmd(other, &paths, &out).await
         }
     }
@@ -693,12 +746,9 @@ async fn run_relay(r: RelayRun, out: &Out) -> Result<(), CliError> {
     });
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
+    crate::sys::shutdown_signal()
+        .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?
+        .await;
     h.shutdown().await;
     Ok(())
 }
@@ -761,6 +811,23 @@ pub fn check_ssh_destination(destination: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Quote the executable for Windows OpenSSH and MSYS ssh. Reject shell expansions.
+pub fn windows_proxy_quote(s: &str) -> Result<String, String> {
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '%' | '$' | '`'))
+    {
+        return Err(
+            "install warren in a path without quotes, %, $, backticks or control characters".into(),
+        );
+    }
+    let path = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else {
+        s.strip_prefix(r"\\?\").unwrap_or(s).replace('\\', "/")
+    };
+    Ok(format!("\"{path}\""))
+}
+
 /// Arguments for `warren ssh`.
 pub fn ssh_args(exe: &str, destination: &str, port: u16, extra: &[String]) -> Vec<String> {
     let mut v = vec![
@@ -807,6 +874,9 @@ fn human_status(v: &Value) -> String {
             })
             .unwrap_or_else(|| "every node".into());
         s += &format!("  port {} -> {to}\n", sh["port"]);
+    }
+    if v["gateway_audit"]["degraded"].as_bool() == Some(true) {
+        s += "gateway audit: degraded; new grants and connections require audit repair\n";
     }
     s += "forwards:\n";
     for f in v["forwards"].as_array().cloned().unwrap_or_default() {
@@ -932,7 +1002,32 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             out.print(&v, || human_status(&v));
             Ok(())
         }
-        Command::Share { port, to } => {
+        Command::Share {
+            port,
+            to,
+            target,
+            name,
+        } => {
+            if let (Some(target), Some(name)) = (target, name) {
+                let req = ControlRequest::GatewaySet {
+                    name: name.clone(),
+                    target: target.clone(),
+                    to: to.clone(),
+                };
+                match control::request(paths, &req).await {
+                    Ok(r) if r.ok => {}
+                    Ok(r) => return Err(from_response(r)),
+                    Err(ControlError::NotRunning) => {
+                        let grant = node::gateway::grant(paths, name.clone(), target, to)?;
+                        node::gateway::offline_mutate(paths, Some(grant), &name)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                out.print(&json!({"name":name,"gateway":true}), || {
+                    format!("sharing named gateway {name} with the granted pinned keys")
+                });
+                return Ok(());
+            }
             let mut s = SharesFile::load(paths)?;
             if let Some(port) = port {
                 if port == 0 {
@@ -947,20 +1042,41 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                         ));
                     }
                 }
-                s.set(port, to.clone());
-                s.save(paths)?;
+                match control::request(
+                    paths,
+                    &ControlRequest::ShareSet {
+                        port,
+                        to: to.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(r) if r.ok => {}
+                    Ok(r) => return Err(from_response(r)),
+                    Err(ControlError::NotRunning) => {
+                        s.set(port, to.clone());
+                        s.save(paths)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 let v = json!({"port": port, "to": to});
                 out.print(&v, || match &to {
                     Some(l) => format!("sharing 127.0.0.1:{port} with {}", l.join(", ")),
                     None => format!("sharing 127.0.0.1:{port} with every enrolled node"),
                 });
             } else {
-                let v = serde_json::to_value(&s.shares).unwrap_or_default();
+                let mut v = serde_json::to_value(&s.shares).unwrap_or_default();
+                if let Some(list) = v.as_array_mut() {
+                    for g in &s.gateways {
+                        list.push(json!({"name":g.name,"gateway":true,"to":g.peers.keys().collect::<Vec<_>>()}));
+                    }
+                }
                 out.print(&v, || {
-                    if s.shares.is_empty() {
+                    if s.shares.is_empty() && s.gateways.is_empty() {
                         return "no ports shared".into();
                     }
-                    s.shares
+                    let ports: String = s
+                        .shares
                         .iter()
                         .map(|x| {
                             format!(
@@ -971,15 +1087,55 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                                     .unwrap_or_else(|| "every node".into())
                             )
                         })
-                        .collect()
+                        .collect();
+                    let gateways: String = s
+                        .gateways
+                        .iter()
+                        .map(|g| {
+                            format!(
+                                "gateway {} -> {}\n",
+                                g.name,
+                                g.peers.keys().cloned().collect::<Vec<_>>().join(", ")
+                            )
+                        })
+                        .collect();
+                    ports + &gateways
                 });
             }
             Ok(())
         }
-        Command::Unshare { port } => {
+        Command::Unshare { port, name } => {
+            if let Some(name) = name {
+                match control::request(paths, &ControlRequest::GatewayRemove { name: name.clone() })
+                    .await
+                {
+                    Ok(r) if r.ok => {}
+                    Ok(r) => return Err(from_response(r)),
+                    Err(ControlError::NotRunning) => {
+                        node::gateway::offline_mutate(paths, None, &name)?
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                out.print(&json!({"name":name,"removed":true}), || {
+                    format!("gateway {name} revoked; old connections closed")
+                });
+                return Ok(());
+            }
+            let port = port.ok_or_else(|| {
+                CliError::new(exit::USAGE, "usage", "a port or --name is required")
+            })?;
             let mut s = SharesFile::load(paths)?;
-            let removed = s.remove(port);
-            s.save(paths)?;
+            let removed = match control::request(paths, &ControlRequest::ShareRemove { port }).await
+            {
+                Ok(r) if r.ok => r.result["removed"].as_bool().unwrap_or(false),
+                Ok(r) => return Err(from_response(r)),
+                Err(ControlError::NotRunning) => {
+                    let removed = s.remove(port);
+                    s.save(paths)?;
+                    removed
+                }
+                Err(e) => return Err(e.into()),
+            };
             out.print(&json!({"port": port, "removed": removed}), || {
                 if removed {
                     format!("port {port} is no longer shared")
@@ -992,6 +1148,7 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         Command::Forward {
             local,
             target,
+            share,
             remove,
         } => {
             if let Some(l) = remove {
@@ -1020,11 +1177,32 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             }
             match (local, target) {
                 (Some(local), Some(t)) => {
-                    let (node, port) = parse_target(&t)?;
-                    let req = ControlRequest::ForwardAdd {
-                        local,
-                        node: node.clone(),
-                        port,
+                    let (node, port) = if share.is_some() {
+                        if !crate::valid_name(&t)
+                            || !share.as_ref().is_some_and(|s| crate::valid_name(s))
+                        {
+                            return Err(CliError::new(
+                                exit::USAGE,
+                                "usage",
+                                "invalid node or share name",
+                            ));
+                        }
+                        (t, 0)
+                    } else {
+                        parse_target(&t)?
+                    };
+                    let req = if let Some(name) = &share {
+                        ControlRequest::GatewayForwardAdd {
+                            local,
+                            node: node.clone(),
+                            share: name.clone(),
+                        }
+                    } else {
+                        ControlRequest::ForwardAdd {
+                            local,
+                            node: node.clone(),
+                            port,
+                        }
                     };
                     let running = match control::request(paths, &req).await {
                         Ok(r) if r.ok => true,
@@ -1037,6 +1215,7 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                                 local,
                                 node: node.clone(),
                                 port,
+                                share: share.clone(),
                             });
                             f.forwards.sort_by_key(|x| x.local);
                             f.save(paths)?;
@@ -1044,12 +1223,20 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    let v = json!({"local": local, "node": node, "port": port, "active": running});
+                    let mut v =
+                        json!({"local": local, "node": node, "port": port, "active": running});
+                    if let Some(name) = &share {
+                        v["share"] = json!(name);
+                    }
+                    let destination = share
+                        .as_ref()
+                        .map(|name| format!("{node} --share {name}"))
+                        .unwrap_or_else(|| format!("{node}:{port}"));
                     out.print(&v, || {
                         if running {
-                            format!("forwarding 127.0.0.1:{local} -> {node}:{port}")
+                            format!("forwarding 127.0.0.1:{local} -> {destination}")
                         } else {
-                            format!("saved 127.0.0.1:{local} -> {node}:{port}; it starts when `warren up` runs")
+                            format!("saved 127.0.0.1:{local} -> {destination}; it starts when `warren up` runs")
                         }
                     });
                     Ok(())
@@ -1068,10 +1255,13 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                         list.iter()
                             .map(|f| {
                                 format!(
-                                    "127.0.0.1:{} -> {}:{}\n",
+                                    "127.0.0.1:{} -> {}{}\n",
                                     f["local"],
                                     f["node"].as_str().unwrap_or(""),
-                                    f["port"]
+                                    f["share"]
+                                        .as_str()
+                                        .map(|name| format!(" --share {name}"))
+                                        .unwrap_or_else(|| format!(":{}", f["port"]))
                                 )
                             })
                             .collect()
@@ -1085,16 +1275,21 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                 )),
             }
         }
-        Command::Nc { node, port } => {
-            let (mut r, mut w) = match control::open(paths, &node, port).await? {
+        Command::Nc { node, port, share } => {
+            let result = if let Some(share) = share {
+                control::open_gateway(paths, &node, &share).await?
+            } else {
+                control::open(paths, &node, port.unwrap()).await?
+            };
+            let (mut r, mut w) = match result {
                 Ok(p) => p,
                 Err(resp) => return Err(from_response(resp)),
             };
             let up = async {
                 let mut stdin = tokio::io::stdin();
-                let _ = tokio::io::copy(&mut stdin, &mut w).await;
+                tokio::io::copy(&mut stdin, &mut w).await?;
                 use tokio::io::AsyncWriteExt;
-                let _ = w.shutdown().await;
+                w.shutdown().await
             };
             let down = async {
                 let mut stdout = tokio::io::stdout();
@@ -1109,7 +1304,7 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
             let mut up_done = false;
             let res = loop {
                 tokio::select! {
-                    _ = &mut up, if !up_done => up_done = true,
+                    r = &mut up, if !up_done => { r.map_err(anyhow::Error::from)?; up_done = true; },
                     r = &mut down => break r,
                 }
             };
@@ -1125,14 +1320,57 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
                 .map_err(|m| CliError::new(exit::USAGE, "usage", m))?;
             let exe = std::env::current_exe()
                 .map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
-            let argv = ssh_args(&exe.to_string_lossy(), &destination, port, &args);
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new("ssh").args(&argv).exec();
-            Err(CliError::new(
-                exit::ERROR,
-                "exec",
-                format!("running ssh: {err}"),
-            ))
+            let mut argv = ssh_args(&exe.to_string_lossy(), &destination, port, &args);
+            // Forward --home too: environment inheritance alone cannot carry a CLI override.
+            #[cfg(unix)]
+            {
+                argv[1] = format!(
+                    "ProxyCommand={} --home {} nc %h {port}",
+                    proxy_quote(&exe.to_string_lossy()),
+                    proxy_quote(&paths.home.to_string_lossy())
+                );
+            }
+            #[cfg(windows)]
+            {
+                let quote = |s: &str| {
+                    windows_proxy_quote(s).map_err(|e| CliError::new(exit::USAGE, "usage", e))
+                };
+                argv[1] = format!(
+                    "ProxyCommand={} --home {} nc %h {port}",
+                    quote(&exe.to_string_lossy())?,
+                    quote(&paths.home.to_string_lossy())?
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new("ssh").args(&argv).exec();
+                Err(CliError::new(
+                    exit::ERROR,
+                    "exec",
+                    format!("running ssh: {err}"),
+                ))
+            }
+            #[cfg(windows)]
+            {
+                // Validate before passing the ProxyCommand to either Windows or MSYS ssh.
+                windows_proxy_quote(&exe.to_string_lossy())
+                    .map_err(|e| CliError::new(exit::USAGE, "usage", e))?;
+                let _ctrl_c = tokio::signal::windows::ctrl_c().map_err(anyhow::Error::from)?;
+                let status = std::process::Command::new("ssh")
+                    .args(&argv)
+                    .status()
+                    .map_err(|e| {
+                        CliError::new(
+                            exit::ERROR,
+                            "exec",
+                            format!(
+                                "running ssh: {e}; install the OpenSSH Client optional feature"
+                            ),
+                        )
+                    })?;
+                std::process::exit(status.code().unwrap_or(exit::ERROR));
+            }
         }
         Command::Publish {
             port,
@@ -1231,7 +1469,25 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Install { no_start, dir } => {
             let o = install_opts(paths, dir, !no_start)?;
+            #[cfg(windows)]
+            let r = if o.dir.is_none() && o.start {
+                let mut prepared = o.clone();
+                prepared.start = false;
+                let mut report = install::install(&prepared)?;
+                stop_for_install(paths).await?;
+                let started = install::start_registered(&o)?;
+                report.started = started.started;
+                report.commands.extend(started.commands);
+                report
+            } else {
+                install::install(&o)?
+            };
+            #[cfg(unix)]
             let r = install::install(&o)?;
+            #[cfg(windows)]
+            if r.started {
+                wait_for_daemon(paths).await?;
+            }
             let v = serde_json::to_value(&r).unwrap_or_default();
             out.print(&v, || {
                 if r.started {
@@ -1244,6 +1500,10 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Uninstall { dir } => {
             let o = install_opts(paths, dir, false)?;
+            #[cfg(windows)]
+            if o.dir.is_none() {
+                stop_for_install(paths).await?;
+            }
             let r = install::uninstall(&o)?;
             let v = serde_json::to_value(&r).unwrap_or_default();
             out.print(&v, || format!("removed {}", r.path.display()));
@@ -1251,6 +1511,37 @@ async fn node_cmd(cmd: Command, paths: &NodePaths, out: &Out) -> Result<(), CliE
         }
         Command::Relay(_) | Command::Up => unreachable!("handled in run"),
     }
+}
+
+#[cfg(windows)]
+async fn stop_for_install(paths: &NodePaths) -> Result<(), CliError> {
+    match control::request(paths, &ControlRequest::Shutdown).await {
+        Ok(r) if r.ok => {}
+        Ok(r) => return Err(from_response(r)),
+        Err(ControlError::NotRunning) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    for _ in 0..100 {
+        if !control::daemon_running(paths).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(CliError::new(
+        exit::ERROR,
+        "install",
+        "the previous daemon did not stop",
+    ))
+}
+#[cfg(windows)]
+async fn wait_for_daemon(paths: &NodePaths) -> Result<(), CliError> {
+    for _ in 0..100 {
+        if control::daemon_running(paths).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(CliError::new(exit::ERROR, "install", "Task Scheduler accepted the start, but the daemon did not become ready; inspect logs/warren.log"))
 }
 
 fn install_opts(
@@ -1261,8 +1552,11 @@ fn install_opts(
     let flavor = Flavor::current()?;
     let exe =
         std::env::current_exe().map_err(|e| CliError::new(exit::ERROR, "error", e.to_string()))?;
+    #[cfg(unix)]
     let exe = exe.canonicalize().unwrap_or(exe);
-    let custom_home = std::env::var_os("WARREN_HOME").is_some_and(|v| !v.is_empty());
+    let custom_home = node::default_home()
+        .map(|home| home != paths.home)
+        .unwrap_or(true);
     let home = if paths.home.is_absolute() {
         paths.home.clone()
     } else {
@@ -1285,11 +1579,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_gateway_cli_modes_are_unambiguous() {
+        for args in [
+            vec![
+                "warren",
+                "share",
+                "--target",
+                "camera.local:554",
+                "--name",
+                "camera",
+                "--to",
+                "alice,bob",
+            ],
+            vec!["warren", "unshare", "--name", "camera"],
+            vec!["warren", "nc", "gateway", "--share", "camera"],
+            vec!["warren", "forward", "8554", "gateway", "--share", "camera"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec![
+                "warren",
+                "share",
+                "22",
+                "--target",
+                "camera.local:554",
+                "--name",
+                "camera",
+            ],
+            vec!["warren", "share", "--target", "camera.local:554"],
+            vec!["warren", "unshare", "22", "--name", "camera"],
+            vec!["warren", "nc", "gateway", "22", "--share", "camera"],
+            vec!["warren", "forward", "--share", "camera"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn cli_parses() {
         Cli::command().debug_assert();
         let c = Cli::try_parse_from(["warren", "share", "22", "--to", "a,b"]).unwrap();
         match c.command {
-            Command::Share { port, to } => {
+            Command::Share { port, to, .. } => {
                 assert_eq!(port, Some(22));
                 assert_eq!(to, Some(vec!["a".into(), "b".into()]));
             }
@@ -1353,6 +1685,26 @@ mod tests {
         );
         assert_eq!(a[2], "me@b");
         assert_eq!(a[3], "-v");
+    }
+
+    #[test]
+    fn windows_proxy_quotes_spaces_and_rejects_expansion() {
+        assert_eq!(
+            windows_proxy_quote(r"C:\my tools\warren.exe").unwrap(),
+            "\"C:/my tools/warren.exe\""
+        );
+        for path in [
+            "C:/a%PATH%/warren.exe",
+            "C:/a$b/warren.exe",
+            "C:/a`b/warren.exe",
+            "C:/a\"b/warren.exe",
+        ] {
+            assert!(windows_proxy_quote(path).is_err());
+        }
+        let c =
+            Cli::try_parse_from(["warren", "up", "--background", "--home", "C:/my home"]).unwrap();
+        assert_eq!(c.home, Some(PathBuf::from("C:/my home")));
+        assert!(c.background);
     }
 
     #[test]

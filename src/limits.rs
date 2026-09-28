@@ -60,6 +60,7 @@ pub const WANTED_OPEN_FILES: u64 = 65536;
 ///
 /// Processes often start with a soft limit of 256 (macOS) or 1024 (Linux),
 /// far below what a busy relay needs, while the hard limit is much higher.
+#[cfg(unix)]
 pub fn raise_open_files_limit(want: u64) -> u64 {
     use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
     let cur = getrlimit(Resource::Nofile);
@@ -77,6 +78,12 @@ pub fn raise_open_files_limit(want: u64) -> u64 {
         target = (target / 2).max(soft);
     }
     soft
+}
+
+/// Windows handles have no Unix descriptor soft limit.
+#[cfg(windows)]
+pub fn raise_open_files_limit(_want: u64) -> u64 {
+    u64::MAX
 }
 
 // Checked at compile time: the budgets admit everything flow control allows
@@ -290,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn open_files_limit_is_raised_not_lowered() {
         use rustix::process::{getrlimit, Resource};
         let hard = getrlimit(Resource::Nofile).maximum.unwrap_or(u64::MAX);

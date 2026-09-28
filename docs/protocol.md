@@ -156,7 +156,7 @@ flags u8 | port u16 | dest (len u8, bytes) | src (len u8, bytes)
          | src_static (len u8 = 0 or 32, bytes) | client (len u8, bytes)
 ```
 
-* `flags`: bit 0 = `PUBLIC` (a relay-terminated public connection).
+* `flags`: `0` = legacy private port; `0x01` = `PUBLIC` (relay-terminated public connection); `0x02` = named `GATEWAY`. Gateway always uses port `0`, with the share selector carried only in encrypted Hello. Client OPEN accepts only flags 0 with nonzero port, or flags 2 with zero port; all other combinations are rejected.
 * A node opening a private stream sets `port` and `dest` (the peer's name)
   and leaves the rest empty.
 * When the relay forwards it, it sets `src` to the authenticated name of the
@@ -311,3 +311,9 @@ commands on the relay host write the same file and bump a revision counter the
 running relay polls every second, so revocations take effect within about a
 second: the node is disconnected, its streams are reset and its published
 names are released.
+
+## Named LAN gateway candidate
+
+Named gateway shares add explicit, key-bound LAN access to the existing loopback
+shares. See [gateway security and commands](gateway-shares.md).
+The source candidate is not yet the Windows-inclusive v0.2.0 release.
