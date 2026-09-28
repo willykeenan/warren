@@ -2175,16 +2175,17 @@ mod tests {
                         "OPEN_OK must reach the pre-Noise authorization check: {error}"
                     );
                 }
-                let seen = observed.lock().unwrap();
-                assert_eq!(
-                    seen.opens, 1,
-                    "no second OPEN after RateLimited-time revoke"
-                );
-                assert_eq!(
-                    seen.data, 0,
-                    "no Noise data after OPEN acknowledgement-time revoke"
-                );
-                drop(seen);
+                {
+                    let seen = observed.lock().unwrap();
+                    assert_eq!(
+                        seen.opens, 1,
+                        "no second OPEN after RateLimited-time revoke"
+                    );
+                    assert_eq!(
+                        seen.data, 0,
+                        "no Noise data after OPEN acknowledgement-time revoke"
+                    );
+                }
                 daemon.shutdown().await;
                 relay.shutdown().await;
             }
