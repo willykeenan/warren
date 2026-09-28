@@ -5,11 +5,11 @@
 use crate::limits::{MAX_LINK_QUEUE, NODE_LINK_DATA_BUDGET};
 use crate::proto::{ErrorCode, Frame, FrameType, MAX_PAYLOAD, MAX_WS_MESSAGE, STREAM_WINDOW};
 use bytes::Bytes;
-use futures_util::{Sink, SinkExt};
+use futures_util::{task::AtomicWaker, Sink, SinkExt};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -197,6 +197,10 @@ impl LinkOut {
     /// Queue a DATA frame, waiting while the link's DATA budget is used up.
     /// Returns false if the link is (or gets) closed.
     pub async fn send_data(&self, f: Frame) -> bool {
+        self.send_data_on(f, None).await
+    }
+
+    async fn send_data_on(&self, f: Frame, stream: Option<&StreamShared>) -> bool {
         if self.closed.is_cancelled() {
             return false;
         }
@@ -209,6 +213,12 @@ impl LinkOut {
             },
             _ = self.closed.cancelled() => return false,
         };
+        // The final enqueue and terminal reset use the same short gate.
+        // A retired allocation cannot enqueue into a reused numeric route.
+        let retired = stream.map(|s| s.retired.lock().unwrap());
+        if retired.as_ref().is_some_and(|r| **r) {
+            return false;
+        }
         permit.forget();
         self.acct.data.fetch_add(n, Ordering::AcqRel);
         if self.closed.is_cancelled()
@@ -315,6 +325,11 @@ pub struct StreamShared {
     fin_sent: AtomicBool,
     fin_recv: AtomicBool,
     reset: AtomicBool,
+    // Serializes terminal ownership and synchronous wire enqueue, never awaits
+    // or host table removal. Exactly one terminal path owns numeric cleanup.
+    retired: Mutex<bool>,
+    local_abort: CancellationToken,
+    read_waker: AtomicWaker,
 }
 
 impl StreamShared {
@@ -326,6 +341,9 @@ impl StreamShared {
             fin_sent: AtomicBool::new(false),
             fin_recv: AtomicBool::new(false),
             reset: AtomicBool::new(false),
+            retired: Mutex::new(false),
+            local_abort: CancellationToken::new(),
+            read_waker: AtomicWaker::new(),
         }
     }
 
@@ -351,6 +369,12 @@ pub struct Slot {
 impl Slot {
     /// Deliver a frame. Returns true if the slot must be removed from the table.
     pub fn deliver(&mut self, f: Frame, out: &LinkOut) -> bool {
+        let shared = self.shared.clone();
+        let mut retired = shared.retired.lock().unwrap();
+        if *retired {
+            // Another path owns removal; do not free the ID ahead of it.
+            return false;
+        }
         let id = self.shared.id;
         match f.ty {
             FrameType::Data => {
@@ -359,7 +383,8 @@ impl Slot {
                 if prev.saturating_add(n) > STREAM_WINDOW {
                     tracing::debug!(stream = id, "window overrun; resetting stream");
                     out.send(Frame::reset(id, ErrorCode::WindowOverrun));
-                    self.kill(ErrorCode::WindowOverrun);
+                    self.kill_inner(ErrorCode::WindowOverrun);
+                    *retired = true;
                     return true;
                 }
                 let _ = self.tx.send(StreamEvent::Data(f.payload));
@@ -368,12 +393,14 @@ impl Slot {
             FrameType::Window => {
                 let Ok(n) = f.window_credit() else {
                     out.send(Frame::reset(id, ErrorCode::Protocol));
-                    self.kill(ErrorCode::Protocol);
+                    self.kill_inner(ErrorCode::Protocol);
+                    *retired = true;
                     return true;
                 };
                 if self.shared.credit.available_permits() + n as usize > MAX_CREDIT {
                     out.send(Frame::reset(id, ErrorCode::Protocol));
-                    self.kill(ErrorCode::Protocol);
+                    self.kill_inner(ErrorCode::Protocol);
+                    *retired = true;
                     return true;
                 }
                 self.shared.credit.add_permits(n as usize);
@@ -383,10 +410,13 @@ impl Slot {
                 None => {
                     self.shared.fin_recv.store(true, Ordering::SeqCst);
                     let _ = self.tx.send(StreamEvent::Fin);
-                    self.shared.fully_closed()
+                    let closed = self.shared.fully_closed();
+                    *retired = closed;
+                    closed
                 }
                 Some(code) => {
-                    self.kill(code);
+                    self.kill_inner(code);
+                    *retired = true;
                     true
                 }
             },
@@ -401,7 +431,8 @@ impl Slot {
                 if let Some(r) = self.open_reply.take() {
                     let _ = r.send(Err((code, msg)));
                 }
-                self.kill(code);
+                self.kill_inner(code);
+                *retired = true;
                 true
             }
             _ => false,
@@ -410,6 +441,11 @@ impl Slot {
 
     /// Abort the stream locally (link died or protocol error).
     pub fn kill(&mut self, code: ErrorCode) {
+        *self.shared.retired.lock().unwrap() = true;
+        self.kill_inner(code);
+    }
+
+    fn kill_inner(&mut self, code: ErrorCode) {
         self.shared.reset.store(true, Ordering::SeqCst);
         self.shared.credit.close();
         if let Some(r) = self.open_reply.take() {
@@ -423,21 +459,56 @@ impl Slot {
     }
 }
 
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // Detached slots can never grant an old handle numeric-route custody.
+        *self.shared.retired.lock().unwrap() = true;
+    }
+}
+
 struct Guard {
     host: Arc<dyn StreamHost>,
     shared: Arc<StreamShared>,
 }
 
+impl Guard {
+    fn reset(&self, code: ErrorCode) {
+        let owns_cleanup = {
+            let mut retired = self.shared.retired.lock().unwrap();
+            let owns_cleanup = !*retired;
+            *retired = true;
+            self.shared.reset.store(true, Ordering::SeqCst);
+            self.shared.local_abort.cancel();
+            self.shared.read_waker.wake();
+            self.shared.credit.close();
+            if owns_cleanup {
+                self.host.out().send(Frame::reset(self.shared.id, code));
+            }
+            owns_cleanup
+        };
+        // Never acquire the host table while holding the retirement gate:
+        // frame delivery owns the table before acquiring that gate.
+        if owns_cleanup {
+            self.host.remove_stream(self.shared.id);
+        }
+    }
+}
+
+/// Weak reset-only capability: no stream, link or encryption ownership.
+#[derive(Clone)]
+pub(crate) struct MuxAbort(Weak<Guard>);
+
+impl MuxAbort {
+    pub(crate) fn abort(&self) {
+        if let Some(guard) = self.0.upgrade() {
+            guard.reset(ErrorCode::Aborted);
+        }
+    }
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
-        if !self.shared.fully_closed() {
-            self.shared.reset.store(true, Ordering::SeqCst);
-            self.host
-                .out()
-                .send(Frame::reset(self.shared.id, ErrorCode::Aborted));
-        }
-        self.shared.credit.close();
-        self.host.remove_stream(self.shared.id);
+        self.reset(ErrorCode::Aborted);
     }
 }
 
@@ -500,12 +571,19 @@ fn broken(msg: &str) -> io::Error {
 }
 
 impl MuxSender {
+    pub(crate) fn abort_handle(&self) -> MuxAbort {
+        MuxAbort(Arc::downgrade(&self._guard))
+    }
+
     pub fn id(&self) -> u32 {
         self.shared.id
     }
 
     /// Send one DATA frame (at most [`MAX_PAYLOAD`] bytes), waiting for credit.
     pub async fn send(&self, data: Bytes) -> io::Result<()> {
+        if self.shared.local_abort.is_cancelled() {
+            return Err(broken("stream reset"));
+        }
         if data.is_empty() {
             return Ok(());
         }
@@ -528,12 +606,12 @@ impl MuxSender {
         if self.shared.reset.load(Ordering::SeqCst) {
             return Err(broken("stream reset"));
         }
-        if !self
-            .host
-            .out()
-            .send_data(Frame::data(self.shared.id, data))
-            .await
-        {
+        let sent = tokio::select! {
+            biased;
+            _ = self.shared.local_abort.cancelled() => return Err(broken("stream reset")),
+            sent = self.host.out().send_data_on(Frame::data(self.shared.id, data), Some(&self.shared)) => sent,
+        };
+        if !sent {
             return Err(broken("link closed"));
         }
         Ok(())
@@ -549,37 +627,47 @@ impl MuxSender {
 
     /// Graceful half-close (FIN).
     pub fn finish(&self) {
-        if !self.shared.fin_sent.swap(true, Ordering::SeqCst) {
-            self.host.out().send(Frame::fin(self.shared.id));
-            if self.shared.fully_closed() {
-                self.host.remove_stream(self.shared.id);
+        let owns_cleanup = {
+            let mut retired = self.shared.retired.lock().unwrap();
+            if *retired || self.shared.fin_sent.swap(true, Ordering::SeqCst) {
+                return;
             }
+            self.host.out().send(Frame::fin(self.shared.id));
+            let closed = self.shared.fully_closed();
+            *retired = closed;
+            closed
+        };
+        if owns_cleanup {
+            self.host.remove_stream(self.shared.id);
         }
     }
 
     /// Abort the stream in both directions.
     pub fn reset(&self, code: ErrorCode) {
-        if !self.shared.reset.swap(true, Ordering::SeqCst) {
-            self.host.out().send(Frame::reset(self.shared.id, code));
-            self.shared.credit.close();
-            self.host.remove_stream(self.shared.id);
-        }
+        self._guard.reset(code);
     }
 
     /// Refuse an incoming OPEN.
     pub fn reject(&self, code: ErrorCode, msg: &str) {
-        if !self.shared.reset.swap(true, Ordering::SeqCst) {
+        {
+            let mut retired = self.shared.retired.lock().unwrap();
+            if *retired {
+                return;
+            }
+            *retired = true;
+            self.shared.reset.store(true, Ordering::SeqCst);
             self.host
                 .out()
                 .send(Frame::open_err(self.shared.id, code, msg));
             self.shared.credit.close();
-            self.host.remove_stream(self.shared.id);
         }
+        self.host.remove_stream(self.shared.id);
     }
 
     /// Accept an incoming OPEN.
     pub fn accept(&self) -> bool {
-        self.host.out().send(Frame::open_ok(self.shared.id))
+        let retired = self.shared.retired.lock().unwrap();
+        !*retired && self.host.out().send(Frame::open_ok(self.shared.id))
     }
 
     pub fn is_reset(&self) -> bool {
@@ -604,6 +692,10 @@ impl MuxReceiver {
     }
 
     fn credit(&mut self, n: usize) {
+        let retired = self.shared.retired.lock().unwrap();
+        if *retired {
+            return;
+        }
         self.unacked += n as u32;
         if self.unacked >= WINDOW_UPDATE_THRESHOLD {
             let n = self.unacked;
@@ -617,10 +709,18 @@ impl MuxReceiver {
 
     /// Next DATA payload; `Ok(None)` on FIN.
     pub async fn recv(&mut self) -> io::Result<Option<Bytes>> {
+        if self.shared.local_abort.is_cancelled() {
+            return Err(reset_error(ErrorCode::Aborted));
+        }
         if self.eof {
             return Ok(None);
         }
-        match self.rx.recv().await {
+        let event = tokio::select! {
+            biased;
+            _ = self.shared.local_abort.cancelled() => return Err(reset_error(ErrorCode::Aborted)),
+            event = self.rx.recv() => event,
+        };
+        match event {
             Some(StreamEvent::Data(b)) => {
                 self.credit(b.len());
                 Ok(Some(b))
@@ -650,6 +750,10 @@ impl AsyncRead for MuxReceiver {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        this.shared.read_waker.register(cx.waker());
+        if this.shared.local_abort.is_cancelled() {
+            return Poll::Ready(Err(reset_error(ErrorCode::Aborted)));
+        }
         if this.leftover.is_empty() {
             if this.eof {
                 return Poll::Ready(Ok(()));
@@ -764,6 +868,201 @@ mod tests {
                 t.remove(&f.stream);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retired_abort_and_last_drop_preserve_reused_id() {
+        let (h, mut wire) = host();
+        let (slot, tx, mut rx, _) = new_stream(11, h.clone(), false);
+        h.table.lock().unwrap().insert(11, slot);
+        let abort = tx.abort_handle();
+        tx.finish();
+        deliver(&h, Frame::fin(11).encode());
+        assert!(rx.recv().await.unwrap().is_none());
+        assert!(h.table.lock().unwrap().is_empty());
+        while wire.try_recv().is_some() {}
+        let (new_slot, new_tx, _new_rx, _) = new_stream(11, h.clone(), false);
+        h.table.lock().unwrap().insert(11, new_slot);
+        abort.abort();
+        drop(tx);
+        drop(rx); // The last old Guard must not remove the replacement.
+        assert!(h.table.lock().unwrap().contains_key(&11));
+        assert!(wire.try_recv().is_none());
+        new_tx
+            .send(Bytes::from_static(b"replacement survives"))
+            .await
+            .unwrap();
+        assert_eq!(
+            Frame::decode(wire.try_recv().unwrap()).unwrap().ty,
+            FrameType::Data
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_receive_and_accept_cannot_emit_on_reused_id() {
+        let (h, mut wire) = host();
+        let (slot, tx, mut rx, _) = new_stream(15, h.clone(), false);
+        h.table.lock().unwrap().insert(15, slot);
+        deliver(
+            &h,
+            Frame::data(15, Bytes::from(vec![0; MAX_PAYLOAD])).encode(),
+        );
+        tx.finish();
+        deliver(&h, Frame::fin(15).encode());
+        while wire.try_recv().is_some() {}
+        let (slot, _new_tx, _new_rx, _) = new_stream(15, h.clone(), false);
+        h.table.lock().unwrap().insert(15, slot);
+        assert!(rx.recv().await.unwrap().is_some()); // drain old buffered bytes
+        assert!(!tx.accept());
+        assert!(
+            wire.try_recv().is_none(),
+            "old WINDOW/OPEN_OK must not reach a reused route"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_claim_cannot_release_id_before_claimant_cleanup() {
+        struct PausedHost {
+            out: LinkOut,
+            table: Mutex<HashMap<u32, Slot>>,
+            paused: AtomicBool,
+            entered: std::sync::mpsc::Sender<()>,
+            resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl StreamHost for PausedHost {
+            fn out(&self) -> &LinkOut {
+                &self.out
+            }
+            fn remove_stream(&self, id: u32) {
+                if !self.paused.swap(true, Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                }
+                self.table.lock().unwrap().remove(&id);
+            }
+        }
+        let (out, _wire) = LinkOut::new(CancellationToken::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let h = Arc::new(PausedHost {
+            out,
+            table: Mutex::new(HashMap::new()),
+            paused: AtomicBool::new(false),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let (slot, tx, rx, _) = new_stream(13, h.clone(), false);
+        h.table.lock().unwrap().insert(13, slot);
+        tx.finish(); // Incoming FIN would normally release this slot.
+        let abort = tx.abort_handle();
+        let worker = std::thread::spawn(move || abort.abort());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        {
+            let mut table = h.table.lock().unwrap();
+            // Force delivery while the reset claimant is paused immediately
+            // before numeric removal. It must not release the route early.
+            assert!(!table.get_mut(&13).unwrap().deliver(Frame::fin(13), &h.out));
+            assert!(!table
+                .get_mut(&13)
+                .unwrap()
+                .deliver(Frame::reset(13, ErrorCode::Aborted), &h.out));
+            assert!(table.contains_key(&13));
+        }
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(h.table.lock().unwrap().is_empty());
+        let (slot, new_tx, _new_rx, _) = new_stream(13, h.clone(), false);
+        h.table.lock().unwrap().insert(13, slot);
+        drop(tx);
+        drop(rx);
+        assert!(h.table.lock().unwrap().contains_key(&13));
+        new_tx
+            .send(Bytes::from_static(b"new allocation"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_wakes_link_budget_and_async_read_without_direction_access() {
+        let (out, mut wire) = LinkOut::with_data_budget(CancellationToken::new(), MAX_WS_MESSAGE);
+        let h = Arc::new(TestHost {
+            out,
+            table: Mutex::new(HashMap::new()),
+        });
+        let (slot, tx, mut rx, _) = new_stream(7, h.clone(), false);
+        h.table.lock().unwrap().insert(7, slot);
+        let abort = tx.abort_handle();
+        tx.send(Bytes::from(vec![0; MAX_PAYLOAD])).await.unwrap();
+        {
+            let send = tx.send(Bytes::from_static(b"blocked on link budget"));
+            let mut byte = [0];
+            let read = tokio::io::AsyncReadExt::read(&mut rx, &mut byte);
+            tokio::pin!(send, read);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    send.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    read.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            abort.abort();
+            abort.clone().abort();
+            let (s, r) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(&mut send, &mut read)
+            })
+            .await
+            .unwrap();
+            assert!(s.is_err());
+            assert!(r.is_err());
+        }
+        assert!(tx.send(Bytes::new()).await.is_err());
+        assert!(rx.recv().await.is_err());
+        let frames: Vec<_> = std::iter::from_fn(|| wire.try_recv())
+            .map(|f| Frame::decode(f).unwrap())
+            .collect();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f.close_kind() == Some(ErrorCode::Aborted) && f.ty == FrameType::Close)
+                .count(),
+            1
+        );
+        assert_eq!(frames.iter().filter(|f| f.ty == FrameType::Data).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn weak_abort_handle_does_not_retain_stream_or_host() {
+        let (h, mut wire) = host();
+        let weak_host = Arc::downgrade(&h);
+        let (slot, tx, rx, _) = new_stream(9, h.clone(), false);
+        h.table.lock().unwrap().insert(9, slot);
+        let abort = tx.abort_handle();
+        let weak_guard = abort.0.clone();
+        drop(tx);
+        assert!(weak_guard.upgrade().is_some());
+        drop(rx);
+        assert!(weak_guard.upgrade().is_none());
+        assert!(h.table.lock().unwrap().is_empty());
+        drop(h);
+        assert!(weak_host.upgrade().is_none());
+        abort.abort();
+        assert!(wire.try_recv().is_some()); // ordinary last-half drop reset
+        assert!(wire.try_recv().is_none()); // dead weak handle sent nothing
     }
 
     #[tokio::test]

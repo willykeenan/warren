@@ -18,7 +18,7 @@
 //!   arrives without it is treated as truncation.
 
 use crate::crypto::{Identity, NOISE_PARAMS, NOISE_PROLOGUE};
-use crate::mux::{MuxReceiver, MuxSender};
+use crate::mux::{MuxAbort, MuxReceiver, MuxSender};
 use crate::proto::{ErrorCode, MAX_PAYLOAD};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -222,7 +222,30 @@ pub struct SecureChannel {
     pub rx: SecureReceiver,
 }
 
+/// Cloneable, reset-only capability obtained before borrowing either direction.
+/// It holds no encryption state and only a weak reference to the stream.
+/// Dropping a handle does nothing; aborting after both halves drop is a no-op.
+#[derive(Clone)]
+pub struct SecureAbort {
+    inner: MuxAbort,
+}
+
+impl SecureAbort {
+    /// Terminal, idempotent reset of both directions. Does not wait for I/O
+    /// borrowers, undo queued bytes, or wait for remote acknowledgement.
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
+}
+
 impl SecureChannel {
+    /// Obtain a capability that can abort while either half is mutably borrowed.
+    pub fn abort_handle(&self) -> SecureAbort {
+        SecureAbort {
+            inner: self.tx.tx.abort_handle(),
+        }
+    }
+
     fn new(tx: MuxSender, rx: MuxReceiver, t: snow::StatelessTransportState) -> SecureChannel {
         let t = Arc::new(t);
         SecureChannel {
@@ -295,16 +318,38 @@ pub struct SecureSender {
     buf: Vec<u8>,
 }
 
+// A canceled send must not reuse an advanced Noise nonce. Reset on error or
+// future drop, including cancellation while waiting for mux credit/budget.
+struct AbortSend(Option<MuxAbort>);
+impl Drop for AbortSend {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 impl SecureSender {
     /// Encrypt and send up to [`MAX_PLAINTEXT`] bytes.
     pub async fn send(&mut self, plain: &[u8]) -> io::Result<()> {
-        debug_assert!(plain.len() <= MAX_PLAINTEXT);
+        if self.tx.is_reset() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stream reset"));
+        }
+        if plain.len() > MAX_PLAINTEXT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plaintext too large",
+            ));
+        }
+        let mut pending = AbortSend(Some(self.tx.abort_handle()));
         let n = self
             .t
             .write_message(self.nonce, plain, &mut self.buf)
             .map_err(|e| io::Error::other(format!("encrypt: {e}")))?;
         self.nonce += 1;
-        self.tx.send(Bytes::copy_from_slice(&self.buf[..n])).await
+        self.tx.send(Bytes::copy_from_slice(&self.buf[..n])).await?;
+        pending.0 = None;
+        Ok(())
     }
 
     /// Send the authenticated end-of-stream marker and FIN.
@@ -453,6 +498,122 @@ mod tests {
             }
         });
         ((ta, ra), (tb, rb), wire)
+    }
+
+    async fn established_pair() -> (SecureChannel, SecureChannel) {
+        let ((ta, ra), (tb, rb), _wire) = pair();
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let public = ib.static_pub;
+        let hello = Hello {
+            v: 1,
+            src: "a".into(),
+            dest: "b".into(),
+            port: 22,
+            share: None,
+        };
+        let responder = tokio::spawn(async move {
+            respond(tb, rb, &ib)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap()
+                .accept()
+                .await
+                .unwrap()
+        });
+        let a = initiate(ta, ra, &ia, &public, &hello).await.unwrap();
+        (a, responder.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn abort_wakes_full_window_writer_and_pending_reader() {
+        let (mut a, _b) = established_pair().await;
+        let abort = a.abort_handle();
+        let clone = abort.clone();
+        let data = vec![7; MAX_PLAINTEXT];
+        for _ in 0..3 {
+            a.tx.send(&data).await.unwrap();
+        }
+        {
+            let write = a.tx.send(&data);
+            let read = a.rx.recv();
+            tokio::pin!(write, read);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    write.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending(),
+                "writer must hold an advanced nonce while blocked on credit"
+            );
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    read.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            // Neither mutable direction is available here. The independent
+            // handle still aborts both futures without taking their borrow.
+            abort.abort();
+            clone.abort();
+            let (w, r) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(&mut write, &mut read)
+            })
+            .await
+            .unwrap();
+            assert!(w.is_err());
+            assert!(r.is_err());
+        }
+        assert!(a.tx.send(b"never reused").await.is_err());
+        assert!(a.tx.finish().await.is_err());
+        assert!(a.rx.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_send_automatically_aborts_advanced_nonce() {
+        let (mut a, _b) = established_pair().await;
+        let data = vec![8; MAX_PLAINTEXT];
+        for _ in 0..3 {
+            a.tx.send(&data).await.unwrap();
+        }
+        {
+            let write = a.tx.send(&data);
+            tokio::pin!(write);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    write.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            // Drop the suspended send without explicitly calling abort.
+        }
+        assert!(a.tx.send(b"nonce cannot be reused").await.is_err());
+        assert!(a.rx.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_handle_does_not_own_keys_or_change_half_close() {
+        let (mut a, mut b) = established_pair().await;
+        let abort = a.abort_handle();
+        drop(abort.clone()); // Handle drop is not implicit abort.
+        a.tx.finish().await.unwrap();
+        assert!(b.rx.recv().await.unwrap().is_none());
+        b.tx.send(b"half close response").await.unwrap();
+        assert_eq!(a.rx.recv().await.unwrap().unwrap(), b"half close response");
+        b.tx.finish().await.unwrap();
+        assert!(a.rx.recv().await.unwrap().is_none());
+        let keys = Arc::downgrade(&a.tx.t);
+        drop(a);
+        assert!(keys.upgrade().is_none());
+        abort.abort(); // Safe after all channel owners are gone.
+        abort.abort();
     }
 
     #[tokio::test]
