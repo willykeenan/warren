@@ -66,6 +66,15 @@ pub fn backoff_delay(attempt: u32, min: Duration, max: Duration) -> Duration {
 /// Why opening a private stream failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
+    /// A strict client operation received a malformed name or selector.
+    #[error("invalid client argument")]
+    InvalidArgument,
+    /// The exact local, explicitly approved pin does not authorize this operation.
+    #[error("peer approval rejected")]
+    PinRejected,
+    /// The local approval store cannot be read, validated or durably updated.
+    #[error("peer approval storage unavailable")]
+    StorageUnavailable,
     #[error("not connected to the relay")]
     NotConnected,
     #[error("{node}: {message} ({code})")]
@@ -91,6 +100,9 @@ pub enum OpenError {
 impl OpenError {
     pub fn code(&self) -> String {
         match self {
+            OpenError::InvalidArgument => "invalid_argument".into(),
+            OpenError::PinRejected => "pin_rejected".into(),
+            OpenError::StorageUnavailable => "storage_unavailable".into(),
             OpenError::NotConnected => "not_connected".into(),
             OpenError::Refused { code, .. } => code.name().into(),
             OpenError::KeyChanged { .. } => "key_changed".into(),
@@ -98,6 +110,18 @@ impl OpenError {
             OpenError::Handshake(..) => "handshake_failed".into(),
             OpenError::Other(_) => "error".into(),
         }
+    }
+}
+
+// Preserve local approval failures across pacing/retry without confusing them
+// with an actual remote refusal. The ordinary session API keeps its tuple shape.
+enum SessionOpenError {
+    Transport(ErrorCode, String),
+    Approval(OpenError),
+}
+impl From<(ErrorCode, String)> for SessionOpenError {
+    fn from((code, message): (ErrorCode, String)) -> Self {
+        Self::Transport(code, message)
     }
 }
 
@@ -233,7 +257,15 @@ impl Session {
         port: u16,
         flags: u8,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
-        self.open_mode_approved(dest, port, flags, None).await
+        self.open_mode_approved(dest, port, flags, None)
+            .await
+            .map_err(|error| match error {
+                SessionOpenError::Transport(code, message) => (code, message),
+                // No approval is supplied on this legacy path.
+                SessionOpenError::Approval(_) => {
+                    (ErrorCode::Forbidden, "peer approval rejected".into())
+                }
+            })
     }
 
     async fn open_mode_approved(
@@ -242,12 +274,14 @@ impl Session {
         port: u16,
         flags: u8,
         approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
-    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+    ) -> Result<(MuxSender, MuxReceiver), SessionOpenError> {
         let deadline = Instant::now() + SESSION_WAIT;
         loop {
             self.pace_open().await;
             match self.open_once(dest, port, flags, approval).await {
-                Err((ErrorCode::RateLimited, _)) if Instant::now() < deadline => {
+                Err(SessionOpenError::Transport(ErrorCode::RateLimited, _))
+                    if Instant::now() < deadline =>
+                {
                     tokio::time::sleep(retry_jitter(20, 80)).await;
                 }
                 r => return r,
@@ -261,14 +295,14 @@ impl Session {
         port: u16,
         flags: u8,
         approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
-    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+    ) -> Result<(MuxSender, MuxReceiver), SessionOpenError> {
         // Every attempt checks after pacing/retry and lock acquisition. There is
         // no await from this check through enqueue; trust writes use this lock.
         let approval_guard = if let Some((daemon, key, snapshot)) = approval {
             let guard = daemon.peers_lock.lock().await;
             daemon
                 .check_approval(dest, key, snapshot)
-                .map_err(|e| (ErrorCode::Forbidden, e.to_string()))?;
+                .map_err(SessionOpenError::Approval)?;
             Some(guard)
         } else {
             None
@@ -279,7 +313,8 @@ impl Session {
                 return Err((
                     ErrorCode::TooManyStreams,
                     "too many streams on this node".into(),
-                ));
+                )
+                    .into());
             }
             let id = loop {
                 let id = self.next_odd.fetch_add(2, Ordering::Relaxed);
@@ -299,11 +334,13 @@ impl Session {
             ..Default::default()
         };
         if !self.out.send(Frame::new(FrameType::Open, id, p.encode())) {
-            return Err((ErrorCode::LinkClosed, "relay connection closed".into()));
+            return Err((ErrorCode::LinkClosed, "relay connection closed".into()).into());
         }
         // Revocation must not wait for the relay or Noise handshake.
         drop(approval_guard);
-        mux::wait_open(reply, Duration::from_secs(15)).await?;
+        mux::wait_open(reply, Duration::from_secs(15))
+            .await
+            .map_err(SessionOpenError::from)?;
         Ok((tx, rx))
     }
 
@@ -1142,22 +1179,20 @@ impl DaemonInner {
     /// This grants future opens only; it does not authenticate the user's UI action.
     pub async fn approve_peer_key(&self, name: &str, key: &[u8; 32]) -> Result<(), OpenError> {
         if !crate::valid_name(name) {
-            return Err(OpenError::Other("invalid peer name".into()));
+            return Err(OpenError::InvalidArgument);
         }
         let _guard = self.peers_lock.lock().await;
-        let mut pins = KnownPeers::load(&self.cfg.paths)
-            .map_err(|_| OpenError::Other("peer approval store unreadable".into()))?;
+        let mut pins =
+            KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
         if pins.relay.is_empty() && pins.peers.is_empty() {
             pins.relay = self.ident.relay.clone();
         }
         if pins.relay != self.ident.relay {
-            return Err(OpenError::Other("peer approval relay mismatch".into()));
+            return Err(OpenError::PinRejected);
         }
         match pins.check(name, key) {
             PinCheck::Changed { .. } => {
-                return Err(OpenError::Other(
-                    "existing peer key differs; explicit forget required".into(),
-                ));
+                return Err(OpenError::PinRejected);
             }
             PinCheck::Match => {
                 let record = pins.peers.get_mut(name).expect("matched pin exists");
@@ -1169,7 +1204,7 @@ impl DaemonInner {
             PinCheck::New => pins.pin(name, key, true),
         }
         pins.save(&self.cfg.paths)
-            .map_err(|_| OpenError::Other("peer approval could not be saved".into()))
+            .map_err(|_| OpenError::StorageUnavailable)
     }
 
     /// Forget only the exact key the local owner intended to revoke.
@@ -1177,20 +1212,18 @@ impl DaemonInner {
     /// drain them before acknowledging a complete disconnect.
     pub async fn forget_peer_key(&self, name: &str, expected: &[u8; 32]) -> Result<(), OpenError> {
         if !crate::valid_name(name) {
-            return Err(OpenError::Other("invalid peer name".into()));
+            return Err(OpenError::InvalidArgument);
         }
         let _guard = self.peers_lock.lock().await;
-        let mut pins = KnownPeers::load(&self.cfg.paths)
-            .map_err(|_| OpenError::Other("peer approval store unreadable".into()))?;
+        let mut pins =
+            KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
         if pins.relay != self.ident.relay || !matches!(pins.check(name, expected), PinCheck::Match)
         {
-            return Err(OpenError::Other(
-                "exact current peer approval required".into(),
-            ));
+            return Err(OpenError::PinRejected);
         }
         pins.peers.remove(name);
         pins.save(&self.cfg.paths)
-            .map_err(|_| OpenError::Other("peer approval could not be saved".into()))
+            .map_err(|_| OpenError::StorageUnavailable)
     }
 
     /// Open an encrypted named share with the same explicit approval boundary.
@@ -1216,7 +1249,7 @@ impl DaemonInner {
             || share.as_ref().is_some_and(|s| !crate::valid_name(s))
             || (share.is_some() != (port == 0))
         {
-            return Err(OpenError::Other("invalid selector".into()));
+            return Err(OpenError::InvalidArgument);
         }
         let approval = {
             let _g = self.peers_lock.lock().await;
@@ -1234,10 +1267,13 @@ impl DaemonInner {
                 Some((self, expected_key, &approval)),
             )
             .await
-            .map_err(|(code, message)| OpenError::Refused {
-                code,
-                node: dest.to_string(),
-                message,
+            .map_err(|error| match error {
+                SessionOpenError::Approval(error) => error,
+                SessionOpenError::Transport(code, message) => OpenError::Refused {
+                    code,
+                    node: dest.to_string(),
+                    message,
+                },
             })?;
         {
             let _g = self.peers_lock.lock().await;
@@ -1269,9 +1305,7 @@ impl DaemonInner {
             Ok(current) if current == approval => Ok(channel),
             other => {
                 channel.tx.reset(ErrorCode::Forbidden);
-                Err(other.err().unwrap_or_else(|| {
-                    OpenError::Other("peer approval changed while opening".into())
-                }))
+                Err(other.err().unwrap_or_else(|| OpenError::PinRejected))
             }
         }
     }
@@ -1283,9 +1317,7 @@ impl DaemonInner {
         snapshot: &super::KnownPeer,
     ) -> Result<(), OpenError> {
         if self.approved_peer(dest, key)? != *snapshot {
-            return Err(OpenError::Other(
-                "peer approval changed while opening".into(),
-            ));
+            return Err(OpenError::PinRejected);
         }
         Ok(())
     }
@@ -1296,8 +1328,7 @@ impl DaemonInner {
         name: &str,
         expected_key: &[u8; 32],
     ) -> Result<super::KnownPeer, OpenError> {
-        let pins = KnownPeers::load(&self.cfg.paths)
-            .map_err(|e| OpenError::Other(format!("reading peer approval: {e:#}")))?;
+        let pins = KnownPeers::load(&self.cfg.paths).map_err(|_| OpenError::StorageUnavailable)?;
         let record = pins.peers.get(name).filter(|record| {
             pins.relay == self.ident.relay
                 && record.trusted_at.is_some()
@@ -1305,11 +1336,7 @@ impl DaemonInner {
                     .pinned(name)
                     .is_some_and(|key| crypto::ct_eq(&key, expected_key))
         });
-        record.cloned().ok_or_else(|| {
-            OpenError::Other(format!(
-                "{name}: exact explicitly trusted peer key required"
-            ))
-        })
+        record.cloned().ok_or(OpenError::PinRejected)
     }
 
     pub async fn open_gateway(
@@ -2022,6 +2049,7 @@ mod tests {
         opens: usize,
         data: usize,
         reply: Option<ErrorCode>,
+        corrupt_store: bool,
         paths: Option<NodePaths>,
         relay: Option<Arc<crate::relay::RelayInner>>,
     }
@@ -2069,9 +2097,13 @@ mod tests {
                     assert!(link.out.send(Frame::open_ok(frame.stream)));
                 }
                 let paths = seen.paths.as_ref().unwrap();
-                let mut pins = KnownPeers::load(paths).unwrap();
-                pins.peers.remove("b");
-                pins.save(paths).unwrap();
+                if seen.corrupt_store {
+                    std::fs::write(paths.known_peers(), b"{").unwrap();
+                } else {
+                    let mut pins = KnownPeers::load(paths).unwrap();
+                    pins.peers.remove("b");
+                    pins.save(paths).unwrap();
+                }
             }
         }));
         let relay = crate::relay::start(cfg).await.unwrap();
@@ -2111,86 +2143,97 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn pinned_approval_removed_during_pacing_emits_zero_open() {
         use std::{future::Future, task::Poll};
-        for share in [None, Some("camera".to_string())] {
-            let observed = Arc::new(Mutex::new(OpenObservation::default()));
-            let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
-            {
-                let session = daemon.inner.current().unwrap();
-                let mut bucket = session.opens.lock().unwrap();
-                *bucket = TokenBucket::new(1, 1);
-                assert!(bucket.take_or_wait().is_ok());
+        for corrupt_store in [false, true] {
+            for share in [None, Some("camera".to_string())] {
+                let observed = Arc::new(Mutex::new(OpenObservation::default()));
+                let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+                {
+                    let session = daemon.inner.current().unwrap();
+                    let mut bucket = session.opens.lock().unwrap();
+                    *bucket = TokenBucket::new(1, 1);
+                    assert!(bucket.take_or_wait().is_ok());
+                }
+                let port = if share.is_some() { 0 } else { 49100 };
+                let mut opening =
+                    Box::pin(daemon.inner.open_selected_pinned("b", port, share, &key));
+                std::future::poll_fn(|cx| {
+                    assert!(matches!(opening.as_mut().poll(cx), Poll::Pending));
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(observed.lock().unwrap().opens, 0);
+                if corrupt_store {
+                    std::fs::write(daemon.inner.cfg.paths.known_peers(), b"{").unwrap();
+                } else {
+                    let mut pins = KnownPeers::load(&daemon.inner.cfg.paths).unwrap();
+                    pins.peers.remove("b");
+                    pins.save(&daemon.inner.cfg.paths).unwrap();
+                }
+                let error = tokio::time::timeout(Duration::from_secs(3), opening)
+                    .await
+                    .unwrap()
+                    .err()
+                    .expect("guard must fail");
+                assert!(
+                    matches!(
+                        (&error, corrupt_store),
+                        (OpenError::PinRejected, false) | (OpenError::StorageUnavailable, true)
+                    ),
+                    "{error}"
+                );
+                assert_eq!(
+                    observed.lock().unwrap().opens,
+                    0,
+                    "no OPEN after pacing-time revoke"
+                );
+                daemon.shutdown().await;
+                relay.shutdown().await;
             }
-            let port = if share.is_some() { 0 } else { 49100 };
-            let mut opening = Box::pin(daemon.inner.open_selected_pinned("b", port, share, &key));
-            std::future::poll_fn(|cx| {
-                assert!(matches!(opening.as_mut().poll(cx), Poll::Pending));
-                Poll::Ready(())
-            })
-            .await;
-            assert_eq!(observed.lock().unwrap().opens, 0);
-            let mut pins = KnownPeers::load(&daemon.inner.cfg.paths).unwrap();
-            pins.peers.remove("b");
-            pins.save(&daemon.inner.cfg.paths).unwrap();
-            assert!(tokio::time::timeout(Duration::from_secs(3), opening)
-                .await
-                .unwrap()
-                .is_err());
-            assert_eq!(
-                observed.lock().unwrap().opens,
-                0,
-                "no OPEN after pacing-time revoke"
-            );
-            daemon.shutdown().await;
-            relay.shutdown().await;
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn pinned_retry_and_ack_recheck_approval_before_more_traffic() {
-        for reply in [ErrorCode::RateLimited, ErrorCode::Forbidden] {
-            for share in [None, Some("camera".to_string())] {
-                let observed = Arc::new(Mutex::new(OpenObservation::default()));
-                let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
-                observed.lock().unwrap().reply = Some(reply);
-                let port = if share.is_some() { 0 } else { 49100 };
-                let error = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    daemon.inner.open_selected_pinned("b", port, share, &key),
-                )
-                .await
-                .unwrap()
-                .err()
-                .expect("revoked approval must fail");
-                if reply == ErrorCode::RateLimited {
+        for corrupt_store in [false, true] {
+            for reply in [ErrorCode::RateLimited, ErrorCode::Forbidden] {
+                for share in [None, Some("camera".to_string())] {
+                    let observed = Arc::new(Mutex::new(OpenObservation::default()));
+                    let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+                    {
+                        let mut seen = observed.lock().unwrap();
+                        seen.reply = Some(reply);
+                        seen.corrupt_store = corrupt_store;
+                    }
+                    let port = if share.is_some() { 0 } else { 49100 };
+                    let error = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        daemon.inner.open_selected_pinned("b", port, share, &key),
+                    )
+                    .await
+                    .unwrap()
+                    .err()
+                    .expect("revoked approval must fail");
                     assert!(
                         matches!(
-                            error,
-                            OpenError::Refused {
-                                code: ErrorCode::Forbidden,
-                                ..
-                            }
+                            (&error, corrupt_store),
+                            (OpenError::PinRejected, false) | (OpenError::StorageUnavailable, true)
                         ),
-                        "retry must reach the authorization guard: {error}"
+                        "guard must retain typed error after retry/OPEN_OK: {error}"
                     );
-                } else {
-                    assert!(
-                        matches!(error, OpenError::Other(_)),
-                        "OPEN_OK must reach the pre-Noise authorization check: {error}"
-                    );
+                    {
+                        let seen = observed.lock().unwrap();
+                        assert_eq!(
+                            seen.opens, 1,
+                            "no second OPEN after RateLimited-time revoke"
+                        );
+                        assert_eq!(
+                            seen.data, 0,
+                            "no Noise data after OPEN acknowledgement-time revoke"
+                        );
+                    }
+                    daemon.shutdown().await;
+                    relay.shutdown().await;
                 }
-                {
-                    let seen = observed.lock().unwrap();
-                    assert_eq!(
-                        seen.opens, 1,
-                        "no second OPEN after RateLimited-time revoke"
-                    );
-                    assert_eq!(
-                        seen.data, 0,
-                        "no Noise data after OPEN acknowledgement-time revoke"
-                    );
-                }
-                daemon.shutdown().await;
-                relay.shutdown().await;
             }
         }
     }

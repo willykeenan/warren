@@ -83,3 +83,15 @@ Identity keys still live in private `identity.json` application-file storage.
 Keychain/protected-data/backup exclusion, C ABI, runtime ownership, iOS packaging and native device
 acceptance are separate integration requirements. This is not native enrollment
 or a mobile-delivered feature, and does not authorize background persistence.
+
+Strict expected-key client operations now expose data-free `OpenError` categories
+for callers that must not parse diagnostic strings. `InvalidArgument` means a
+malformed peer name or selector; `PinRejected` means a missing, untrusted, wrong,
+wrong-relay or changed local approval; `StorageUnavailable` means the approval
+store cannot be read, validated or saved. Their `code()` values are respectively
+`invalid_argument`, `pin_rejected`, and `storage_unavailable`, and their display
+text is fixed. These types survive pacing, retry, pre-Noise and final approval
+checks. An actual peer/relay refusal remains `Refused`, including `Forbidden`;
+transport and legacy errors retain their existing forms. This changes error
+classification only, not approval rules, lock scope or channel lifetime. Native
+bindings still must map categories explicitly and drain existing streams.
