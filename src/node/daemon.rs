@@ -233,10 +233,20 @@ impl Session {
         port: u16,
         flags: u8,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        self.open_mode_approved(dest, port, flags, None).await
+    }
+
+    async fn open_mode_approved(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        flags: u8,
+        approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
+    ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
         let deadline = Instant::now() + SESSION_WAIT;
         loop {
             self.pace_open().await;
-            match self.open_once(dest, port, flags).await {
+            match self.open_once(dest, port, flags, approval).await {
                 Err((ErrorCode::RateLimited, _)) if Instant::now() < deadline => {
                     tokio::time::sleep(retry_jitter(20, 80)).await;
                 }
@@ -250,7 +260,19 @@ impl Session {
         dest: &str,
         port: u16,
         flags: u8,
+        approval: Option<(&DaemonInner, &[u8; 32], &super::KnownPeer)>,
     ) -> Result<(MuxSender, MuxReceiver), (ErrorCode, String)> {
+        // Every attempt checks after pacing/retry and lock acquisition. There is
+        // no await from this check through enqueue; trust writes use this lock.
+        let approval_guard = if let Some((daemon, key, snapshot)) = approval {
+            let guard = daemon.peers_lock.lock().await;
+            daemon
+                .check_approval(dest, key, snapshot)
+                .map_err(|e| (ErrorCode::Forbidden, e.to_string()))?;
+            Some(guard)
+        } else {
+            None
+        };
         let (tx, rx, reply, id) = {
             let mut t = self.table.lock().unwrap();
             if t.len() >= MAX_STREAMS_PER_NODE {
@@ -279,6 +301,8 @@ impl Session {
         if !self.out.send(Frame::new(FrameType::Open, id, p.encode())) {
             return Err((ErrorCode::LinkClosed, "relay connection closed".into()));
         }
+        // Revocation must not wait for the relay or Noise handshake.
+        drop(approval_guard);
         mux::wait_open(reply, Duration::from_secs(15)).await?;
         Ok((tx, rx))
     }
@@ -1010,6 +1034,138 @@ impl DaemonInner {
         self.open_selected(dest, port, None).await
     }
 
+    /// Open using an exact, explicitly trusted local pin and no relay key lookup.
+    /// Approval is checked again after the handshake; this is not a lifetime
+    /// revocation subscription. See `docs/PINNED-CLIENT.md`.
+    pub async fn open_private_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected_pinned(dest, port, None, expected_key)
+            .await
+    }
+
+    /// Open an encrypted named share with the same explicit approval boundary.
+    /// No ordinary-port fallback or relay key lookup is permitted.
+    pub async fn open_gateway_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        share: &str,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        self.open_selected_pinned(dest, 0, Some(share.to_string()), expected_key)
+            .await
+    }
+
+    async fn open_selected_pinned(
+        self: &Arc<Self>,
+        dest: &str,
+        port: u16,
+        share: Option<String>,
+        expected_key: &[u8; 32],
+    ) -> Result<SecureChannel, OpenError> {
+        if !crate::valid_name(dest)
+            || share.as_ref().is_some_and(|s| !crate::valid_name(s))
+            || (share.is_some() != (port == 0))
+        {
+            return Err(OpenError::Other("invalid selector".into()));
+        }
+        let approval = {
+            let _g = self.peers_lock.lock().await;
+            self.approved_peer(dest, expected_key)?
+        };
+        let session = self
+            .wait_session(SESSION_WAIT)
+            .await
+            .ok_or(OpenError::NotConnected)?;
+        let (tx, rx) = session
+            .open_mode_approved(
+                dest,
+                port,
+                if share.is_some() { FLAG_GATEWAY } else { 0 },
+                Some((self, expected_key, &approval)),
+            )
+            .await
+            .map_err(|(code, message)| OpenError::Refused {
+                code,
+                node: dest.to_string(),
+                message,
+            })?;
+        {
+            let _g = self.peers_lock.lock().await;
+            if let Err(error) = self.check_approval(dest, expected_key, &approval) {
+                tx.reset(ErrorCode::Forbidden);
+                return Err(error);
+            }
+        }
+        let hello = Hello {
+            share,
+            v: 1,
+            src: self.ident.name.clone(),
+            dest: dest.to_string(),
+            port,
+        };
+        let channel = noise::initiate(tx, rx, &self.id, expected_key, &hello)
+            .await
+            .map_err(|e| match e {
+                noise::NoiseError::Refused(code) => OpenError::Refused {
+                    code,
+                    node: dest.to_string(),
+                    message: "the destination refused the stream".into(),
+                },
+                e => OpenError::Handshake(dest.to_string(), e.to_string()),
+            })?;
+        let _g = self.peers_lock.lock().await;
+        let still_approved = self.approved_peer(dest, expected_key);
+        match still_approved {
+            Ok(current) if current == approval => Ok(channel),
+            other => {
+                channel.tx.reset(ErrorCode::Forbidden);
+                Err(other.err().unwrap_or_else(|| {
+                    OpenError::Other("peer approval changed while opening".into())
+                }))
+            }
+        }
+    }
+
+    fn check_approval(
+        &self,
+        dest: &str,
+        key: &[u8; 32],
+        snapshot: &super::KnownPeer,
+    ) -> Result<(), OpenError> {
+        if self.approved_peer(dest, key)? != *snapshot {
+            return Err(OpenError::Other(
+                "peer approval changed while opening".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read-only approval check, called while holding `peers_lock`.
+    fn approved_peer(
+        &self,
+        name: &str,
+        expected_key: &[u8; 32],
+    ) -> Result<super::KnownPeer, OpenError> {
+        let pins = KnownPeers::load(&self.cfg.paths)
+            .map_err(|e| OpenError::Other(format!("reading peer approval: {e:#}")))?;
+        let record = pins.peers.get(name).filter(|record| {
+            pins.relay == self.ident.relay
+                && record.trusted_at.is_some()
+                && pins
+                    .pinned(name)
+                    .is_some_and(|key| crypto::ct_eq(&key, expected_key))
+        });
+        record.cloned().ok_or_else(|| {
+            OpenError::Other(format!(
+                "{name}: exact explicitly trusted peer key required"
+            ))
+        })
+    }
+
     pub async fn open_gateway(
         self: &Arc<Self>,
         dest: &str,
@@ -1710,6 +1866,185 @@ mod tests {
             assert!(d20 >= Duration::from_secs(30) && d20 <= Duration::from_secs(60));
             let big = backoff_delay(u32::MAX, min, max);
             assert!(big <= max);
+        }
+    }
+
+    // Real loopback relay fixture kept private to this unit-test module. It can
+    // control the existing pacer without exporting any runtime test API.
+    #[derive(Default)]
+    struct OpenObservation {
+        opens: usize,
+        data: usize,
+        reply: Option<ErrorCode>,
+        paths: Option<NodePaths>,
+        relay: Option<Arc<crate::relay::RelayInner>>,
+    }
+
+    async fn pinned_fixture(
+        state: Arc<Mutex<OpenObservation>>,
+    ) -> (
+        tempfile::TempDir,
+        crate::relay::RelayHandle,
+        DaemonHandle,
+        [u8; 32],
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::relay::RelayConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1",
+            temp.path().join("relay"),
+            crate::relay::TlsMode::SelfSigned,
+        );
+        let observed = state.clone();
+        cfg.tap = Some(Arc::new(move |direction, bytes| {
+            if !matches!(direction, mux::TapDir::In) {
+                return;
+            }
+            let frame = Frame::decode(bytes.to_vec().into()).unwrap();
+            let mut seen = observed.lock().unwrap();
+            if frame.ty == FrameType::Data {
+                seen.data += 1;
+            }
+            if frame.ty != FrameType::Open {
+                return;
+            }
+            seen.opens += 1;
+            if let Some(reply) = seen.reply.take() {
+                // Inject the relay response before its normal offline response.
+                // The client still reads it from the real TLS/WebSocket link.
+                let relay = seen.relay.as_ref().unwrap();
+                let online = relay.online.lock().unwrap();
+                let link = online.values().next().unwrap();
+                if reply == ErrorCode::RateLimited {
+                    assert!(link
+                        .out
+                        .send(Frame::open_err(frame.stream, reply, "fixture pacing")));
+                } else {
+                    assert!(link.out.send(Frame::open_ok(frame.stream)));
+                }
+                let paths = seen.paths.as_ref().unwrap();
+                let mut pins = KnownPeers::load(paths).unwrap();
+                pins.peers.remove("b");
+                pins.save(paths).unwrap();
+            }
+        }));
+        let relay = crate::relay::start(cfg).await.unwrap();
+        let url = format!("https://127.0.0.1:{}", relay.addr.port());
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let p = NodePaths::new(temp.path().join(name));
+            let invite = relay
+                .inner
+                .db
+                .create_invite(None, Duration::from_secs(60), crate::now_secs())
+                .unwrap();
+            crate::node::join(&p, &invite, &url, Some(name), relay.cert_sha256, false)
+                .await
+                .unwrap();
+            paths.push(p);
+        }
+        let key = IdentityFile::load(&paths[1])
+            .unwrap()
+            .identity()
+            .unwrap()
+            .static_pub;
+        let daemon = start(DaemonConfig::new(paths[0].clone())).await.unwrap();
+        assert!(daemon.wait_connected(Duration::from_secs(5)).await);
+        let mut pins = KnownPeers::load(&paths[0]).unwrap();
+        pins.relay = daemon.inner.ident.relay.clone();
+        pins.pin("b", &key, true);
+        pins.save(&paths[0]).unwrap();
+        {
+            let mut seen = state.lock().unwrap();
+            seen.paths = Some(paths[0].clone());
+            seen.relay = Some(relay.inner.clone());
+        }
+        (temp, relay, daemon, key)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn pinned_approval_removed_during_pacing_emits_zero_open() {
+        use std::{future::Future, task::Poll};
+        for share in [None, Some("camera".to_string())] {
+            let observed = Arc::new(Mutex::new(OpenObservation::default()));
+            let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+            {
+                let session = daemon.inner.current().unwrap();
+                let mut bucket = session.opens.lock().unwrap();
+                *bucket = TokenBucket::new(1, 1);
+                assert!(bucket.take_or_wait().is_ok());
+            }
+            let port = if share.is_some() { 0 } else { 49100 };
+            let mut opening = Box::pin(daemon.inner.open_selected_pinned("b", port, share, &key));
+            std::future::poll_fn(|cx| {
+                assert!(matches!(opening.as_mut().poll(cx), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(observed.lock().unwrap().opens, 0);
+            let mut pins = KnownPeers::load(&daemon.inner.cfg.paths).unwrap();
+            pins.peers.remove("b");
+            pins.save(&daemon.inner.cfg.paths).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(3), opening)
+                .await
+                .unwrap()
+                .is_err());
+            assert_eq!(
+                observed.lock().unwrap().opens,
+                0,
+                "no OPEN after pacing-time revoke"
+            );
+            daemon.shutdown().await;
+            relay.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn pinned_retry_and_ack_recheck_approval_before_more_traffic() {
+        for reply in [ErrorCode::RateLimited, ErrorCode::Forbidden] {
+            for share in [None, Some("camera".to_string())] {
+                let observed = Arc::new(Mutex::new(OpenObservation::default()));
+                let (_temp, relay, daemon, key) = pinned_fixture(observed.clone()).await;
+                observed.lock().unwrap().reply = Some(reply);
+                let port = if share.is_some() { 0 } else { 49100 };
+                let error = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    daemon.inner.open_selected_pinned("b", port, share, &key),
+                )
+                .await
+                .unwrap()
+                .err()
+                .expect("revoked approval must fail");
+                if reply == ErrorCode::RateLimited {
+                    assert!(
+                        matches!(
+                            error,
+                            OpenError::Refused {
+                                code: ErrorCode::Forbidden,
+                                ..
+                            }
+                        ),
+                        "retry must reach the authorization guard: {error}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, OpenError::Other(_)),
+                        "OPEN_OK must reach the pre-Noise authorization check: {error}"
+                    );
+                }
+                let seen = observed.lock().unwrap();
+                assert_eq!(
+                    seen.opens, 1,
+                    "no second OPEN after RateLimited-time revoke"
+                );
+                assert_eq!(
+                    seen.data, 0,
+                    "no Noise data after OPEN acknowledgement-time revoke"
+                );
+                drop(seen);
+                daemon.shutdown().await;
+                relay.shutdown().await;
+            }
         }
     }
 }
