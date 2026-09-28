@@ -1305,7 +1305,7 @@ impl DaemonInner {
             Ok(current) if current == approval => Ok(channel),
             other => {
                 channel.tx.reset(ErrorCode::Forbidden);
-                Err(other.err().unwrap_or_else(|| OpenError::PinRejected))
+                Err(other.err().unwrap_or(OpenError::PinRejected))
             }
         }
     }
