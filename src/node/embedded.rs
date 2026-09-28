@@ -87,6 +87,120 @@ fn paths(storage_root: &Path) -> Result<NodePaths> {
     Ok(NodePaths::new(storage_root))
 }
 
+/// Validated public metadata. This type contains no identity secrets and has no
+/// serialization implementation; callers choose their own public representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicIdentity {
+    pub name: String,
+    pub noise_static_public_key: [u8; 32],
+    pub signing_public_key: [u8; 32],
+    pub relay_https: String,
+}
+
+fn invalid_metadata() -> anyhow::Error {
+    anyhow::anyhow!("invalid embedded identity metadata")
+}
+
+// Admit the full input before using the deliberately permissive core parser.
+fn canonical_relay(value: &str) -> Result<String> {
+    if value.len() > 2048
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        || value.contains(['@', '?', '#', '\\'])
+    {
+        return Err(invalid_metadata());
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .ok_or_else(invalid_metadata)?;
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() || authority.contains('/') {
+        return Err(invalid_metadata());
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']').ok_or_else(invalid_metadata)?;
+        let host = host
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| invalid_metadata())?;
+        let port = if tail.is_empty() {
+            None
+        } else {
+            Some(tail.strip_prefix(':').ok_or_else(invalid_metadata)?)
+        };
+        (host.to_string(), port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        if host.is_empty()
+            || host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err(invalid_metadata());
+        }
+        if host.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && host.parse::<std::net::Ipv4Addr>().is_err()
+        {
+            return Err(invalid_metadata());
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    let port = match port {
+        Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+            value.parse::<u16>().map_err(|_| invalid_metadata())?
+        }
+        Some(_) => return Err(invalid_metadata()),
+        None => 443,
+    };
+    if port == 0 {
+        return Err(invalid_metadata());
+    }
+    let parsed = crate::net::RelayUrl { host, port };
+    let canonical = parsed.https();
+    if crate::net::RelayUrl::parse(&canonical).map_err(|_| invalid_metadata())? != parsed {
+        return Err(invalid_metadata());
+    }
+    Ok(canonical)
+}
+
+impl PublicIdentity {
+    pub fn from_identity(identity: &IdentityFile) -> Result<Self> {
+        if !crate::valid_name(&identity.name) {
+            return Err(invalid_metadata());
+        }
+        let relay_https = canonical_relay(&identity.relay)?;
+        if relay_https != identity.relay {
+            return Err(invalid_metadata());
+        }
+        let noise_static_public_key =
+            crate::crypto::parse_key32(&identity.static_pub).ok_or_else(invalid_metadata)?;
+        let signing_public_key =
+            crate::crypto::parse_key32(&identity.sign_pub).ok_or_else(invalid_metadata)?;
+        let derived = identity.identity().map_err(|_| invalid_metadata())?;
+        if noise_static_public_key != derived.static_pub || signing_public_key != derived.sign_pub()
+        {
+            return Err(invalid_metadata());
+        }
+        Ok(Self {
+            name: identity.name.clone(),
+            noise_static_public_key,
+            signing_public_key,
+            relay_https,
+        })
+    }
+}
+
 /// Enroll once, without desktop control IPC or replacement of any existing
 /// identity. Cancellation or an uncertain network reply must not be retried
 /// automatically; the application owns explicit recovery.
@@ -97,13 +211,18 @@ pub async fn join(
     name: Option<&str>,
     relay_certificate_pin: Option<[u8; 32]>,
 ) -> Result<IdentityFile, JoinError> {
+    let relay = canonical_relay(relay)
+        .map_err(|_| JoinError::Usage("invalid embedded relay URL".into()))?;
+    if name.is_some_and(|name| !crate::valid_name(name)) {
+        return Err(JoinError::Usage("invalid embedded node name".into()));
+    }
     let paths = paths(storage_root)?;
-    tokio::time::timeout(
+    let identity = tokio::time::timeout(
         Duration::from_secs(45),
         super::join_mode(
             &paths,
             code,
-            relay,
+            &relay,
             name,
             relay_certificate_pin,
             false,
@@ -114,19 +233,99 @@ pub async fn join(
     .map_err(|_| {
         JoinError::Usage("embedded enrollment timed out; outcome may be uncertain".into())
     })?
+    .map_err(|error| match error {
+        JoinError::Usage(_) => JoinError::Usage("embedded enrollment rejected".into()),
+        JoinError::AlreadyEnrolled(_) => JoinError::AlreadyEnrolled("existing identity".into()),
+        JoinError::DaemonRunning(_) => JoinError::DaemonRunning("embedded storage".into()),
+        JoinError::Refused { .. } => JoinError::Refused {
+            code: "refused".into(),
+            message: "embedded enrollment refused".into(),
+        },
+        JoinError::Other(_) => JoinError::Other(anyhow::anyhow!(
+            "embedded enrollment failed; outcome may be uncertain"
+        )),
+    })?;
+    PublicIdentity::from_identity(&identity).map_err(|_| {
+        JoinError::Other(anyhow::anyhow!(
+            "embedded enrollment metadata invalid; outcome may be uncertain"
+        ))
+    })?;
+    Ok(identity)
 }
 
 /// Narrow outbound lifecycle handle. No daemon/control/forward/service mutation
-/// API is public here. Strict pinned opening is a separate composition step.
+/// API is public here. All public opens require an explicitly approved key.
 pub struct EmbeddedClient {
     pub(crate) handle: Option<daemon::DaemonHandle>,
+    public_identity: PublicIdentity,
 }
 impl EmbeddedClient {
     pub async fn start(storage_root: &Path) -> Result<Self> {
         let cfg = daemon::DaemonConfig::new(paths(storage_root)?);
+        let handle = daemon::start_mode(cfg, true)
+            .await
+            .map_err(|_| anyhow::anyhow!("embedded client could not start"))?;
+        // start_mode validated this same immutable identity before spawning tasks.
+        let public_identity = PublicIdentity::from_identity(&handle.inner.ident)?;
         Ok(Self {
-            handle: Some(daemon::start_mode(cfg, true).await?),
+            handle: Some(handle),
+            public_identity,
         })
+    }
+    pub fn public_identity(&self) -> &PublicIdentity {
+        &self.public_identity
+    }
+    pub async fn open_private_pinned(
+        &self,
+        dest: &str,
+        port: u16,
+        expected_key: &[u8; 32],
+    ) -> Result<crate::noise::SecureChannel, daemon::OpenError> {
+        self.handle
+            .as_ref()
+            .ok_or(daemon::OpenError::NotConnected)?
+            .inner
+            .open_private_pinned(dest, port, expected_key)
+            .await
+    }
+    pub async fn open_gateway_pinned(
+        &self,
+        dest: &str,
+        share: &str,
+        expected_key: &[u8; 32],
+    ) -> Result<crate::noise::SecureChannel, daemon::OpenError> {
+        self.handle
+            .as_ref()
+            .ok_or(daemon::OpenError::NotConnected)?
+            .inner
+            .open_gateway_pinned(dest, share, expected_key)
+            .await
+    }
+    /// Record an externally verified exact peer key; this performs no key lookup.
+    pub async fn approve_verified_peer(
+        &self,
+        name: &str,
+        key: &[u8; 32],
+    ) -> Result<(), daemon::OpenError> {
+        self.handle
+            .as_ref()
+            .ok_or(daemon::OpenError::NotConnected)?
+            .inner
+            .approve_peer_key(name, key)
+            .await
+    }
+    /// Remove the exact approval. Existing channels require caller-owned draining.
+    pub async fn forget_verified_peer(
+        &self,
+        name: &str,
+        key: &[u8; 32],
+    ) -> Result<(), daemon::OpenError> {
+        self.handle
+            .as_ref()
+            .ok_or(daemon::OpenError::NotConnected)?
+            .inner
+            .forget_peer_key(name, key)
+            .await
     }
     pub async fn wait_connected(&self, timeout: Duration) -> bool {
         match &self.handle {
@@ -204,7 +403,7 @@ mod tests {
         assert!(server.wait_connected(Duration::from_secs(5)).await);
         assert!(client.wait_connected(Duration::from_secs(5)).await);
         // Internal transport-only probe. No ordinary-open method is exposed by
-        // EmbeddedClient; the separately reviewed pinned API is composed later.
+        // EmbeddedClient; public wrappers have separate strict approval coverage.
         let mut channel = client
             .handle
             .as_ref()

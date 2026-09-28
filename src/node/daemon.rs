@@ -442,6 +442,9 @@ pub(super) async fn start_mode(cfg: DaemonConfig, client_only: bool) -> Result<D
     #[cfg(unix)]
     crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
+    if client_only {
+        super::embedded::PublicIdentity::from_identity(&ident)?;
+    }
     let id = ident.identity()?;
     let relay = ident.relay_url()?;
     let pin = ident.pin()?;

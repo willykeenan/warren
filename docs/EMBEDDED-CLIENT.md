@@ -48,21 +48,38 @@ application must control its private storage root; this is not protection agains
 another writer with the same OS identity modifying its files.
 
 The handle exposes no public daemon, control, service-registration, forwarding
-or unpinned-open methods. Its crate-private `handle` is the composition seam for
-separately reviewed strict expected-key opening. That forwarding API is **not
-implemented in this leaf**. One internal test uses ordinary opening with a
-seeded explicit pin solely to prove transport and shutdown, not strict opening
-approval. Public API tests cover long application paths, malformed irrelevant
-policy, inbound refusal, no restored forwards/publications, same-root contention,
-mixed same-process/cross-process contention, process-death lock release and IPC
-sentinel preservation.
+or unpinned-open methods. `open_private_pinned(dest, port, expected_key)` and
+`open_gateway_pinned(dest, share, expected_key)` forward to the existing strict
+expected-key APIs. `approve_verified_peer(name, key)` records an exact key the
+caller has verified independently; it performs no relay lookup. It cannot
+silently replace a different approved key. `forget_verified_peer(name, key)`
+removes only that exact approval and blocks future opens. It does not revoke
+already returned channels; the application must drain those streams itself.
+
+`PublicIdentity::from_identity(&IdentityFile)` and `public_identity()` expose only
+name, Noise static public key, signing public key and canonical HTTPS relay.
+There is no serialization implementation or public secret/daemon accessor.
+Both public keys must be exactly 32 bytes and match the private identity; node
+names follow the core lowercase ASCII name rule (1–32 bytes). Client-only start
+validates this metadata before any network tasks start. Persisted relay metadata
+must already be canonical. HTTPS URLs are bounded to 2048 ASCII bytes, with valid
+DNS labels, IPv4 or bracketed IPv6 and a nonzero port. Whitespace, controls,
+userinfo, query, fragment, non-root paths and malformed addresses are rejected
+with fixed bounded errors. Enrollment validates name/relay before storage or
+remote effects, accepting an optional root slash and normalizing hostname case,
+IPv6 and default port before persistence. Core desktop URL behavior is unchanged.
+
+Public wrapper tests use a real loopback TLS relay and encrypted Noise traffic;
+they prove approval-before-OPEN, exact named selector confidentiality/refusal,
+and future-open denial after forgetting. Metadata tests cover bad persisted
+values and a local connection trap. Existing lifecycle tests continue to cover
+inbound refusal, ownership contention, process-death lock release and IPC safety.
 Alias-path tests enroll and start through a symlinked parent, exercise ownership
 contention in both alias/canonical directions and separate processes, and repeat
 final-file rejection checks through an aliased root. These are macOS host tests,
 not iOS runtime or app-container acceptance.
 
 Identity keys still live in private `identity.json` application-file storage.
-Keychain/protected-data/backup exclusion, explicit verified peer approval,
-strict pinned opening, C ABI, runtime ownership, iOS packaging and native device
+Keychain/protected-data/backup exclusion, C ABI, runtime ownership, iOS packaging and native device
 acceptance are separate integration requirements. This is not native enrollment
 or a mobile-delivered feature, and does not authorize background persistence.
