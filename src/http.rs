@@ -586,7 +586,10 @@ pub struct WriteSink<W>(pub W);
 
 impl<W: AsyncWrite + Unpin + Send> ByteSink for WriteSink<W> {
     async fn put(&mut self, data: Bytes) -> io::Result<()> {
-        self.0.write_all(&data).await
+        self.0.write_all(&data).await?;
+        // TLS can accept plaintext while its ciphertext is still buffered by
+        // socket backpressure. Flush before waiting for more upstream input.
+        self.0.flush().await
     }
 }
 
