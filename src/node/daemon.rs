@@ -1047,6 +1047,62 @@ impl DaemonInner {
             .await
     }
 
+    /// Explicit local-owner approval of a previously verified full key.
+    /// Never looks up a key, replaces a different key, or repairs unreadable pins.
+    /// This grants future opens only; it does not authenticate the user's UI action.
+    pub async fn approve_peer_key(&self, name: &str, key: &[u8; 32]) -> Result<(), OpenError> {
+        if !crate::valid_name(name) {
+            return Err(OpenError::Other("invalid peer name".into()));
+        }
+        let _guard = self.peers_lock.lock().await;
+        let mut pins = KnownPeers::load(&self.cfg.paths)
+            .map_err(|_| OpenError::Other("peer approval store unreadable".into()))?;
+        if pins.relay.is_empty() && pins.peers.is_empty() {
+            pins.relay = self.ident.relay.clone();
+        }
+        if pins.relay != self.ident.relay {
+            return Err(OpenError::Other("peer approval relay mismatch".into()));
+        }
+        match pins.check(name, key) {
+            PinCheck::Changed { .. } => {
+                return Err(OpenError::Other(
+                    "existing peer key differs; explicit forget required".into(),
+                ));
+            }
+            PinCheck::Match => {
+                let record = pins.peers.get_mut(name).expect("matched pin exists");
+                if record.trusted_at.is_some() {
+                    return Ok(());
+                }
+                record.trusted_at = Some(crate::now_secs());
+            }
+            PinCheck::New => pins.pin(name, key, true),
+        }
+        pins.save(&self.cfg.paths)
+            .map_err(|_| OpenError::Other("peer approval could not be saved".into()))
+    }
+
+    /// Forget only the exact key the local owner intended to revoke.
+    /// Existing channels are not closed by this operation: the embedding must
+    /// drain them before acknowledging a complete disconnect.
+    pub async fn forget_peer_key(&self, name: &str, expected: &[u8; 32]) -> Result<(), OpenError> {
+        if !crate::valid_name(name) {
+            return Err(OpenError::Other("invalid peer name".into()));
+        }
+        let _guard = self.peers_lock.lock().await;
+        let mut pins = KnownPeers::load(&self.cfg.paths)
+            .map_err(|_| OpenError::Other("peer approval store unreadable".into()))?;
+        if pins.relay != self.ident.relay || !matches!(pins.check(name, expected), PinCheck::Match)
+        {
+            return Err(OpenError::Other(
+                "exact current peer approval required".into(),
+            ));
+        }
+        pins.peers.remove(name);
+        pins.save(&self.cfg.paths)
+            .map_err(|_| OpenError::Other("peer approval could not be saved".into()))
+    }
+
     /// Open an encrypted named share with the same explicit approval boundary.
     /// No ordinary-port fallback or relay key lookup is permitted.
     pub async fn open_gateway_pinned(

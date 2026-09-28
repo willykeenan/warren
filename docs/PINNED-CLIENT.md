@@ -16,6 +16,18 @@ failure. Provision approval through the existing owner-controlled trust path
 after independently verifying the peer's full key; a relay-reported key or
 matching display name alone is not that verification.
 
+An embedding can use `approve_peer_key(name, verified_full_key)` for this explicit
+local-owner decision. It never contacts the relay. An absent key is added; a
+matching TOFU record is approved while preserving its first-seen value; an
+already approved matching record is unchanged. A different or malformed existing
+key fails. A nonempty store with no relay binding, a different relay binding,
+or unreadable storage also fails without overwriting the file.
+`forget_peer_key(name, expected_current_key)` removes only an exact matching
+record. Both operations use the same trust lock as pinned OPEN. They do not
+authenticate the caller's UI decision and do not drain existing channels; those
+responsibilities remain with the embedding. Changing keys requires explicit
+forget followed by a separate verified approval.
+
 The method snapshots the approval record before waiting for a relay session.
 Every actual OPEN enqueue rechecks that snapshot **after** pacing, rate-limit
 retry delays, and acquiring the daemon trust lock. The final synchronous check
