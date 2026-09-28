@@ -11,9 +11,11 @@ use warren::node::{
 async fn long_app_path_enrolls_without_ipc_and_ignores_malformed_desktop_policy() {
     let relay = start_relay().await;
     let dir = tempfile::tempdir().unwrap();
+    // Exceed the platform socket limit even when the runner uses a short /tmp root.
+    // This remains a valid filesystem component on each supported platform.
     let paths = NodePaths::new(
         dir.path()
-            .join("application-support-storage-root-that-exceeds-the-desktop-socket-path-limit"),
+            .join("s".repeat(warren::node::MAX_SOCKET_PATH + 1)),
     );
     #[cfg(unix)]
     assert!(paths.check_control().is_err());
