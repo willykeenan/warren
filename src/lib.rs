@@ -20,6 +20,7 @@
 
 pub mod cli;
 pub mod crypto;
+pub mod device_enrollment;
 pub mod fsutil;
 pub mod gateway_policy;
 pub mod http;

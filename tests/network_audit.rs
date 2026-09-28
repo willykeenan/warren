@@ -62,6 +62,7 @@ fn outbound_connections_only_in_the_dial_module() {
                 "src/install_windows.rs",
                 "src/cli.rs",
                 "src/node/mod.rs",
+                "src/device_enrollment.rs", // Fixed macOS-only read-only ACL inspection; asserted below.
             ],
         ),
     ];
@@ -79,6 +80,10 @@ fn outbound_connections_only_in_the_dial_module() {
             }
         }
     }
+    let enrollment =
+        non_test_source(&std::fs::read_to_string(root.join("src/device_enrollment.rs")).unwrap());
+    assert!(enrollment_acl_command_is_bounded(&enrollment));
+    assert!(enrollment.contains("#[cfg(target_os = \"macos\")]"));
     assert!(
         violations.is_empty(),
         "unexpected network code: {violations:#?}"
@@ -188,5 +193,31 @@ fn windows_security_boundaries_are_explicit() {
                 );
             }
         }
+    }
+}
+
+// The exception is a read-only macOS gateway ACL inspection, never a phone or
+// network-client command. Preserve exact arguments and an empty environment.
+fn enrollment_acl_command_is_bounded(source: &str) -> bool {
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.matches("Command::new").count() == 1
+        && compact.contains(
+            r#"std::process::Command::new("/bin/ls").args(["-lde","--"]).arg(path).env_clear().env("LC_ALL","C").output().map_err(unavailable)?"#,
+        )
+}
+
+#[test]
+fn enrollment_acl_exception_rejects_network_commands_and_changed_environment() {
+    let source = non_test_source(include_str!("../src/device_enrollment.rs"));
+    assert!(enrollment_acl_command_is_bounded(&source));
+    for modified in [
+        source.replace("/bin/ls", "/usr/bin/curl"),
+        source.replace("/bin/ls", "/bin/sh"),
+        source.replace("-lde", "-l"),
+        source.replace(".env_clear()", ""),
+        source.replace("LC_ALL", "PATH"),
+        format!("{source} std::process::Command::new(\"/usr/bin/curl\");"),
+    ] {
+        assert!(!enrollment_acl_command_is_bounded(&modified));
     }
 }
