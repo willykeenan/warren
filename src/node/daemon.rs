@@ -354,8 +354,24 @@ pub struct DaemonInner {
     /// new peer asks the relay once.
     lookup_lock: tokio::sync::Mutex<()>,
     pub shutdown: CancellationToken,
-    gateway: Arc<super::gateway::GatewayRuntime>,
+    gateway: Option<Arc<super::gateway::GatewayRuntime>>,
+    client_only: bool,
+    _home_lease: Arc<super::embedded::HomeLease>,
     private_services: Arc<super::private_service::PrivateServices>,
+}
+
+struct AbortWriter(tokio::task::JoinHandle<()>);
+impl Drop for AbortWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+struct SessionCleanup(Arc<Session>);
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.0.out.close();
+        self.0.teardown();
+    }
 }
 
 /// A running daemon.
@@ -365,12 +381,32 @@ pub struct DaemonHandle {
 }
 
 impl DaemonHandle {
+    pub(super) fn cancel_client(&self) {
+        debug_assert!(self.inner.client_only);
+        self.inner.shutdown.cancel();
+        if let Some(session) = self.inner.session.send_replace(None) {
+            session.out.close();
+            session.teardown();
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+
     pub async fn shutdown(self) {
         self.inner.shutdown.cancel();
-        for t in self.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+        for mut t in self.tasks {
+            if tokio::time::timeout(Duration::from_secs(5), &mut t)
+                .await
+                .is_err()
+            {
+                t.abort();
+                let _ = t.await;
+            }
         }
-        ipc::cleanup(&self.inner.cfg.paths);
+        if !self.inner.client_only {
+            ipc::cleanup(&self.inner.cfg.paths);
+        }
     }
 
     /// Wait until connected to the relay.
@@ -392,23 +428,44 @@ impl DaemonHandle {
 
 /// Start the daemon: control socket, forwards and the relay connection loop.
 pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
-    let open_files = crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES);
+    start_mode(cfg, false).await
+}
+
+pub(super) async fn start_mode(cfg: DaemonConfig, client_only: bool) -> Result<DaemonHandle> {
+    let open_files = if client_only {
+        0
+    } else {
+        crate::limits::raise_open_files_limit(crate::limits::WANTED_OPEN_FILES)
+    };
     let paths = cfg.paths.clone();
-    paths.ensure()?;
+    let home_lease = Arc::new(super::embedded::HomeLease::acquire(&paths)?);
     #[cfg(unix)]
     crate::fsutil::ensure_private_file(&paths.identity())?;
     let ident = IdentityFile::load(&paths)?;
     let id = ident.identity()?;
     let relay = ident.relay_url()?;
     let pin = ident.pin()?;
-    let publishes = PublishesFile::load(&paths)?.publishes;
+    let publishes = if client_only {
+        Vec::new()
+    } else {
+        PublishesFile::load(&paths)?.publishes
+    };
+    let forwards = if client_only {
+        Vec::new()
+    } else {
+        ForwardsFile::load(&paths)?.forwards
+    };
     let (session_tx, _) = watch::channel(None);
-    let gateway = super::gateway::GatewayRuntime::new(
-        paths.clone(),
-        id.clone(),
-        ident.name.clone(),
-        relay.clone(),
-    )?;
+    let gateway = if client_only {
+        None
+    } else {
+        Some(super::gateway::GatewayRuntime::new(
+            paths.clone(),
+            id.clone(),
+            ident.name.clone(),
+            relay.clone(),
+        )?)
+    };
     let private_services =
         super::private_service::PrivateServices::new(paths.clone(), id.clone(), ident.name.clone());
     let inner = Arc::new(DaemonInner {
@@ -431,39 +488,43 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
         lookup_lock: tokio::sync::Mutex::new(()),
         shutdown: CancellationToken::new(),
         gateway,
+        client_only,
+        _home_lease: home_lease,
         private_services,
     });
 
-    let listener = ipc::bind(&paths).await?;
     let mut tasks = Vec::new();
-    {
-        let services = inner.private_services.clone();
-        let stop = inner.shutdown.clone();
-        tasks.push(tokio::spawn(async move { services.watch(stop).await }));
-    }
-    {
-        let g = inner.gateway.clone();
-        let stop = inner.shutdown.clone();
-        tasks.push(tokio::spawn(async move { g.watch(stop).await }));
-    }
-    {
-        let d = inner.clone();
-        tasks.push(tokio::spawn(async move { d.serve_control(listener).await }));
-    }
-    for f in ForwardsFile::load(&paths)?.forwards {
-        if let Err(e) = inner.start_forward(f.clone()) {
-            inner.record_error(format!(
-                "forward {} -> {}:{}: {e:#}",
-                f.local, f.node, f.port
-            ));
-            inner.forwards.lock().unwrap().insert(
-                f.local,
-                ForwardState {
-                    fwd: f,
-                    task: None,
-                    error: Some(format!("{e:#}")),
-                },
-            );
+    if !client_only {
+        let listener = ipc::bind(&paths).await?;
+        {
+            let services = inner.private_services.clone();
+            let stop = inner.shutdown.clone();
+            tasks.push(tokio::spawn(async move { services.watch(stop).await }));
+        }
+        {
+            let g = inner.gateway.as_ref().expect("desktop gateway").clone();
+            let stop = inner.shutdown.clone();
+            tasks.push(tokio::spawn(async move { g.watch(stop).await }));
+        }
+        {
+            let d = inner.clone();
+            tasks.push(tokio::spawn(async move { d.serve_control(listener).await }));
+        }
+        for f in forwards {
+            if let Err(e) = inner.start_forward(f.clone()) {
+                inner.record_error(format!(
+                    "forward {} -> {}:{}: {e:#}",
+                    f.local, f.node, f.port
+                ));
+                inner.forwards.lock().unwrap().insert(
+                    f.local,
+                    ForwardState {
+                        fwd: f,
+                        task: None,
+                        error: Some(format!("{e:#}")),
+                    },
+                );
+            }
         }
     }
     {
@@ -475,6 +536,11 @@ pub async fn start(cfg: DaemonConfig) -> Result<DaemonHandle> {
 }
 
 impl DaemonInner {
+    fn gateway(&self) -> &Arc<super::gateway::GatewayRuntime> {
+        self.gateway
+            .as_ref()
+            .expect("gateway exists only for desktop daemon")
+    }
     /// Install an in-process service for a previously explicitly trusted exact peer key.
     pub async fn register_private_service(
         &self,
@@ -560,7 +626,12 @@ impl DaemonInner {
             }
             self.set_state("connecting");
             let started = Instant::now();
-            match self.connect_once().await {
+            let connected = if self.client_only {
+                tokio::select! { biased; _ = self.shutdown.cancelled() => break, result = self.connect_once() => result }
+            } else {
+                self.connect_once().await
+            };
+            match connected {
                 Ok(reason) => {
                     tracing::info!("relay connection ended: {reason}");
                     if started.elapsed() > Duration::from_secs(30) {
@@ -590,8 +661,9 @@ impl DaemonInner {
             _ = self.shutdown.cancelled() => return Ok("shutting down"),
             r = crate::ws::connect_relay(&self.relay, self.pin) => r?,
         };
-        self.gateway
-            .relay_connected(ws.get_ref().get_ref().0.peer_addr()?.ip());
+        if let Some(gateway) = &self.gateway {
+            gateway.relay_connected(ws.get_ref().get_ref().0.peer_addr()?.ip());
+        }
         let challenge = super::read_challenge(&mut ws).await?;
         let hello = NodeHello::Auth {
             version: PROTOCOL_VERSION,
@@ -626,7 +698,8 @@ impl DaemonInner {
             connected_at: crate::now_secs(),
         });
         let (sink, mut stream) = ws.split();
-        let writer = tokio::spawn(mux::run_writer(sink, rx, out.clone(), None));
+        let mut writer = AbortWriter(tokio::spawn(mux::run_writer(sink, rx, out.clone(), None)));
+        let _session_cleanup = SessionCleanup(session.clone());
         {
             let mut s = self.status.lock().unwrap();
             s.connects += 1;
@@ -634,7 +707,7 @@ impl DaemonInner {
         self.set_state("connected");
         self.session.send_replace(Some(session.clone()));
         tracing::info!(relay = %self.relay.https(), "connected to relay");
-        {
+        if !self.client_only {
             let d = self.clone();
             let s = session.clone();
             tokio::spawn(async move { d.reclaim_publishes(&s).await });
@@ -672,7 +745,13 @@ impl DaemonInner {
         out.close();
         self.session.send_replace(None);
         session.teardown();
-        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        if tokio::time::timeout(Duration::from_secs(2), &mut writer.0)
+            .await
+            .is_err()
+        {
+            writer.0.abort();
+            let _ = (&mut writer.0).await;
+        }
         Ok(reason)
     }
 
@@ -723,6 +802,14 @@ impl DaemonInner {
     }
 
     fn incoming(self: &Arc<Self>, session: &Arc<Session>, f: Frame) {
+        if self.client_only {
+            session.out.send(Frame::open_err(
+                f.stream,
+                ErrorCode::Forbidden,
+                "embedded client refuses inbound streams",
+            ));
+            return;
+        }
         let id = f.stream;
         let Ok(p) = OpenPayload::decode(&f.payload) else {
             session
@@ -758,7 +845,7 @@ impl DaemonInner {
             (tx, rx)
         };
         if p.is_gateway() {
-            self.gateway.spawn(p, tx, rx);
+            self.gateway().spawn(p, tx, rx);
             return;
         }
         if !p.is_public() && self.private_services.reserved(p.port) {
@@ -1413,7 +1500,7 @@ impl DaemonInner {
             .collect();
         let errors: Vec<ErrorEntry> = self.errors.lock().unwrap().iter().cloned().collect();
         let session = self.current();
-        let gateways = self.gateway.status();
+        let gateways = self.gateway().status();
         json!({
             "node": {
                 "name": self.ident.name,
@@ -1430,7 +1517,7 @@ impl DaemonInner {
             },
             "daemon": { "running": true, "pid": std::process::id() },
             "shares": shares.shares,
-            "gateway_audit": self.gateway.audit_health(),
+            "gateway_audit": self.gateway().audit_health(),
             "gateway_count": gateways.len(),
             "gateways": gateways,
             "forwards": forwards,
@@ -1471,20 +1558,20 @@ impl DaemonInner {
                         "port is reserved for an in-process private service",
                     );
                 }
-                match self.gateway.mutate_local(port, to, false).await {
+                match self.gateway().mutate_local(port, to, false).await {
                     Ok(_) => ControlResponse::ok(json!({"port":port})),
                     Err(e) => ControlResponse::err("share_policy", e.to_string()),
                 }
             }
             ControlRequest::ShareRemove { port } => {
-                match self.gateway.mutate_local(port, None, true).await {
+                match self.gateway().mutate_local(port, None, true).await {
                     Ok(removed) => ControlResponse::ok(json!({"port":port,"removed":removed})),
                     Err(e) => ControlResponse::err("share_policy", e.to_string()),
                 }
             }
             ControlRequest::GatewaySet { name, target, to } => {
                 match self
-                    .gateway
+                    .gateway()
                     .mutate(Some((name.clone(), target, to)), &name)
                     .await
                 {
@@ -1493,7 +1580,7 @@ impl DaemonInner {
                 }
             }
             ControlRequest::GatewayRemove { name } => {
-                match self.gateway.mutate(None, &name).await {
+                match self.gateway().mutate(None, &name).await {
                     Ok(()) => ControlResponse::ok(json!({"name":name,"removed":true})),
                     Err(e) => ControlResponse::err("gateway_policy", e.to_string()),
                 }

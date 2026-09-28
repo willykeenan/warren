@@ -4,6 +4,7 @@
 
 pub mod control;
 pub mod daemon;
+pub mod embedded;
 pub mod framed;
 pub mod gateway;
 pub mod ipc;
@@ -409,6 +410,34 @@ pub async fn join(
     pin: Option<[u8; 32]>,
     force: bool,
 ) -> Result<IdentityFile, JoinError> {
+    join_mode(paths, code, relay, name, pin, force, false).await
+}
+
+async fn join_mode(
+    paths: &NodePaths,
+    code: &str,
+    relay: &str,
+    name: Option<&str>,
+    pin: Option<[u8; 32]>,
+    force: bool,
+    embedded: bool,
+) -> Result<IdentityFile, JoinError> {
+    let _embedded_lease = if embedded {
+        Some(embedded::HomeLease::acquire(paths)?)
+    } else {
+        None
+    };
+    if embedded {
+        match std::fs::symlink_metadata(paths.identity()) {
+            Ok(_) => {
+                return Err(JoinError::Usage(
+                    "embedded identity already exists; replacement is forbidden".into(),
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::from(e).into()),
+        }
+    }
     if let Ok(existing) = IdentityFile::load(paths) {
         if !force {
             return Err(JoinError::AlreadyEnrolled(existing.name));
@@ -422,14 +451,28 @@ pub async fn join(
             )));
         }
     }
-    // A home too long for the control socket could never run `warren up`.
-    paths
-        .check_control()
-        .map_err(|e| JoinError::Usage(e.to_string()))?;
-    // A running daemon loaded the current identity at start and would keep
-    // authenticating with it (revoked, after a re-enrollment) forever.
-    if control::daemon_running(paths).await {
-        return Err(JoinError::DaemonRunning(paths.home.display().to_string()));
+    if !embedded {
+        // A home too long for the control socket could never run `warren up`.
+        paths
+            .check_control()
+            .map_err(|e| JoinError::Usage(e.to_string()))?;
+        // A running daemon loaded the current identity at start and would keep
+        // authenticating with it (revoked, after a re-enrollment) forever.
+        if control::daemon_running(paths).await {
+            return Err(JoinError::DaemonRunning(paths.home.display().to_string()));
+        }
+    }
+    let _desktop_lease = if embedded {
+        None
+    } else {
+        Some(embedded::HomeLease::acquire(paths)?)
+    };
+    // Desktop preflight may await IPC; recheck after acquiring ownership so
+    // an enrollment completed during that await cannot be overwritten.
+    if !embedded && !force {
+        if let Ok(existing) = IdentityFile::load(paths) {
+            return Err(JoinError::AlreadyEnrolled(existing.name));
+        }
     }
     let code = crypto::normalize_code(code).ok_or_else(|| JoinError::Refused {
         code: "invalid_code".into(),
