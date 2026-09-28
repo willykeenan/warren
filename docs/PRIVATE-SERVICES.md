@@ -39,6 +39,13 @@ application transaction, audit ledger, expiry policy, or credential rollback.
 `DaemonInner::revoke_private_service(&registration)` invalidates the generation,
 cancels all its pending handshakes and active handler futures, and waits until
 their streams are dropped. A stale handle cannot revoke a replacement generation.
+Each reserved slot retains its last exact opaque registration after explicit
+revocation, policy loss, shutdown, or a handler panic. A handle from another daemon
+or a superseded generation fails even when that port is already revoked. Repeating
+revoke with the same current registration is idempotent and still waits for any
+remaining operations of that generation to drain; an already revoked replacement
+does not make older handles valid again. Identity is the full random 256-bit
+generation plus port, retained only for this daemon instance's lifetime.
 Registration on the same port requires old operations to finish draining and gets
 a new generation. Revocation errors must not be treated as a clean acknowledgment.
 Do not await a service's own revoke from inside its handler: cancellation drops
@@ -49,7 +56,8 @@ or stop the daemon. Daemon shutdown cancels and drains these operations too.
 
 Ordinary TCP shares and public publishes conflict with reserved service ports.
 Both registration and supported local share/publish mutations reject collisions.
-Reserved-port tombstones remain until daemon shutdown, so revocation cannot turn
+Reserved-port tombstones remain for the daemon instance's lifetime, including
+after shutdown, so revocation cannot turn
 a service request into an ordinary TCP/TOFU connection. Disk policy is rechecked
 at admission, after confirmation, and by a 100ms watcher. Removed/changed/untrusted
 pins, unreadable policy or an external share/publish collision cancel the generation;

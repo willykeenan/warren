@@ -82,6 +82,27 @@ struct Grant {
     key: [u8; 32],
     handler: Arc<dyn PrivateServiceHandler>,
 }
+enum ServiceSlot {
+    Active(Grant),
+    Revoked(ServiceRegistration),
+}
+impl ServiceSlot {
+    fn registration(&self) -> &ServiceRegistration {
+        match self {
+            Self::Active(grant) => &grant.registration,
+            Self::Revoked(registration) => registration,
+        }
+    }
+    fn active(&self) -> Option<&Grant> {
+        match self {
+            Self::Active(grant) => Some(grant),
+            Self::Revoked(_) => None,
+        }
+    }
+    fn revoke(&mut self) {
+        *self = Self::Revoked(self.registration().clone());
+    }
+}
 struct Operation {
     registration: ServiceRegistration,
     cancel: CancellationToken,
@@ -90,7 +111,8 @@ struct Operation {
 #[derive(Default)]
 struct State {
     // Tombstones prevent revoked service ports falling back to ordinary TCP shares.
-    ports: BTreeMap<u16, Option<Grant>>,
+    // Retain the last exact identity so only that handle can acknowledge its drain.
+    ports: BTreeMap<u16, ServiceSlot>,
     operations: BTreeMap<u64, Operation>,
     next: u64,
     stopped: bool,
@@ -123,7 +145,7 @@ impl PrivateServices {
                 let mut state = poisoned.into_inner();
                 state.stopped = true;
                 for slot in state.ports.values_mut() {
-                    *slot = None;
+                    slot.revoke();
                 }
                 for operation in state.operations.values() {
                     operation.cancel.cancel();
@@ -170,7 +192,7 @@ impl PrivateServices {
             && state
                 .ports
                 .get(&registration.port)
-                .and_then(Option::as_ref)
+                .and_then(ServiceSlot::active)
                 .is_some_and(|g| g.registration == *registration && self.policy_allows(g))
     }
     pub(crate) fn reserved(&self, port: u16) -> bool {
@@ -205,7 +227,11 @@ impl PrivateServices {
         }
         let mut state = self.lock();
         if state.stopped
-            || state.ports.get(&port).is_some_and(Option::is_some)
+            || state
+                .ports
+                .get(&port)
+                .and_then(ServiceSlot::active)
+                .is_some()
             || (!state.ports.contains_key(&port) && state.ports.len() >= MAX_PORTS)
             || state
                 .operations
@@ -214,7 +240,7 @@ impl PrivateServices {
         {
             bail!("private service unavailable, already registered, or still draining");
         }
-        state.ports.insert(port, Some(grant));
+        state.ports.insert(port, ServiceSlot::Active(grant));
         Ok(registration)
     }
     /// Cancel pending handshakes and active handlers, then wait for stream drop.
@@ -226,13 +252,10 @@ impl PrivateServices {
             let Some(slot) = state.ports.get_mut(&registration.port) else {
                 bail!("unknown service registration");
             };
-            if slot
-                .as_ref()
-                .is_some_and(|g| g.registration != *registration)
-            {
+            if slot.registration() != registration {
                 bail!("stale service registration");
             }
-            *slot = None;
+            slot.revoke();
             Self::cancel(&state, Some(registration))
         };
         Self::drain(waits).await;
@@ -265,7 +288,7 @@ impl PrivateServices {
         loop {
             tokio::select! { biased;
                 _ = stop.cancelled() => {
-                    let waits = { let mut s = self.lock(); s.stopped = true; for g in s.ports.values_mut() { *g = None; } Self::cancel(&s, None) };
+                    let waits = { let mut s = self.lock(); s.stopped = true; for slot in s.ports.values_mut() { slot.revoke(); } Self::cancel(&s, None) };
                     Self::drain(waits).await; return;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -275,13 +298,13 @@ impl PrivateServices {
                 let invalid: Vec<_> = s
                     .ports
                     .values()
-                    .flatten()
+                    .filter_map(ServiceSlot::active)
                     .filter(|g| !self.policy_allows(g))
                     .map(|g| g.registration.clone())
                     .collect();
                 let mut waits = Vec::new();
                 for r in invalid {
-                    s.ports.insert(r.port, None);
+                    s.ports.insert(r.port, ServiceSlot::Revoked(r.clone()));
                     waits.extend(Self::cancel(&s, Some(&r)));
                 }
                 waits
@@ -294,7 +317,12 @@ impl PrivateServices {
         let cancel = CancellationToken::new();
         let (id, grant) = {
             let mut state = self.lock();
-            let Some(grant) = state.ports.get(&p.port).and_then(Option::as_ref).cloned() else {
+            let Some(grant) = state
+                .ports
+                .get(&p.port)
+                .and_then(ServiceSlot::active)
+                .cloned()
+            else {
                 tx.reject(ErrorCode::Forbidden, "private service unavailable");
                 return;
             };

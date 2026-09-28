@@ -226,6 +226,18 @@ async fn confirmed_identity_generation_revoke_and_changed_pin() {
         peer.d().inner.open_private("owner", 49101).await.is_err(),
         "pin repair must not resurrect revoked generation"
     );
+    assert!(
+        owner.d().inner.revoke_private_service(&reg).await.is_err(),
+        "policy-loss tombstone must retain the replacement identity"
+    );
+    for _ in 0..2 {
+        owner
+            .d()
+            .inner
+            .revoke_private_service(&replacement)
+            .await
+            .unwrap();
+    }
     let wire: Vec<u8> = relay
         .captures
         .lock()
@@ -514,6 +526,17 @@ async fn handler_commit_panic_fails_closed_without_breaking_revoke() {
     let mut peer = enroll_started(&relay, "peer").await;
     pin_peer(&owner, &peer, true);
     pin_peer(&peer, &owner, true);
+    let foreign = peer
+        .d()
+        .inner
+        .register_private_service(
+            49105,
+            "owner",
+            owner.identity().static_pub,
+            Arc::new(Handler::default()),
+        )
+        .await
+        .unwrap();
     let reg = owner
         .d()
         .inner
@@ -529,6 +552,16 @@ async fn handler_commit_panic_fails_closed_without_breaking_revoke() {
         closed(&mut channel).await;
     }
     owner.d().inner.revoke_private_service(&reg).await.unwrap();
+    owner.d().inner.revoke_private_service(&reg).await.unwrap();
+    assert!(
+        owner
+            .d()
+            .inner
+            .revoke_private_service(&foreign)
+            .await
+            .is_err(),
+        "panic tombstone must reject a foreign registration"
+    );
     assert!(owner
         .d()
         .inner
@@ -553,8 +586,19 @@ async fn daemon_shutdown_drains_service_and_rejects_registration() {
     pin_peer(&peer, &owner, true);
     let handler = Arc::new(Handler::default());
     let daemon = owner.d().inner.clone();
-    daemon
+    let reg = daemon
         .register_private_service(49106, "peer", peer.identity().static_pub, handler.clone())
+        .await
+        .unwrap();
+    let foreign = peer
+        .d()
+        .inner
+        .register_private_service(
+            49106,
+            "owner",
+            owner.identity().static_pub,
+            Arc::new(Handler::default()),
+        )
         .await
         .unwrap();
     let mut stream = peer.d().inner.open_private("owner", 49106).await.unwrap();
@@ -566,9 +610,129 @@ async fn daemon_shutdown_drains_service_and_rejects_registration() {
     owner.stop().await;
     assert_eq!(handler.active.load(Ordering::SeqCst), 0);
     closed(&mut stream).await;
+    for _ in 0..2 {
+        daemon.revoke_private_service(&reg).await.unwrap();
+    }
+    assert!(
+        daemon.revoke_private_service(&foreign).await.is_err(),
+        "shutdown tombstone must reject a foreign registration"
+    );
     assert!(daemon
         .register_private_service(49106, "peer", peer.identity().static_pub, handler)
         .await
         .is_err());
     peer.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_tombstones_cannot_acknowledge_revoke_and_stale_handles_stay_stale() {
+    let relay = start_relay().await;
+    let mut owner = enroll_started(&relay, "owner").await;
+    let mut peer = enroll_started(&relay, "peer").await;
+    pin_peer(&owner, &peer, true);
+    pin_peer(&peer, &owner, true);
+    let handler = Arc::new(Handler::default());
+    let mut originals = Vec::new();
+    let mut streams = Vec::new();
+    for port in [49110, 49111] {
+        let original = owner
+            .d()
+            .inner
+            .register_private_service(port, "peer", peer.identity().static_pub, handler.clone())
+            .await
+            .unwrap();
+        let unrelated = peer
+            .d()
+            .inner
+            .register_private_service(
+                port,
+                "owner",
+                owner.identity().static_pub,
+                Arc::new(Handler::default()),
+            )
+            .await
+            .unwrap();
+        peer.d()
+            .inner
+            .revoke_private_service(&unrelated)
+            .await
+            .unwrap();
+        assert!(
+            peer.d()
+                .inner
+                .revoke_private_service(&original)
+                .await
+                .is_err(),
+            "a foreign tombstone cannot acknowledge the original daemon's drain"
+        );
+        peer.d()
+            .inner
+            .revoke_private_service(&unrelated)
+            .await
+            .unwrap();
+        let mut stream = peer.d().inner.open_private("owner", port).await.unwrap();
+        stream.tx.send(b"original-still-owned").await.unwrap();
+        assert_eq!(
+            stream.rx.recv().await.unwrap().unwrap(),
+            b"original-still-owned"
+        );
+        originals.push(original);
+        streams.push(stream);
+    }
+    assert_eq!(handler.active.load(Ordering::SeqCst), 2);
+    for (original, stream) in originals.iter().zip(streams.iter_mut()) {
+        let (first, repeated) = tokio::join!(
+            owner.d().inner.revoke_private_service(original),
+            owner.d().inner.revoke_private_service(original),
+        );
+        first.unwrap();
+        repeated.unwrap();
+        closed(stream).await;
+        owner
+            .d()
+            .inner
+            .revoke_private_service(original)
+            .await
+            .unwrap();
+        let replacement = owner
+            .d()
+            .inner
+            .register_private_service(
+                original.port(),
+                "peer",
+                peer.identity().static_pub,
+                handler.clone(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(original.generation(), replacement.generation());
+        owner
+            .d()
+            .inner
+            .revoke_private_service(&replacement)
+            .await
+            .unwrap();
+        assert!(
+            owner
+                .d()
+                .inner
+                .revoke_private_service(original)
+                .await
+                .is_err(),
+            "an old handle stays stale after its replacement is also revoked"
+        );
+        owner
+            .d()
+            .inner
+            .revoke_private_service(&replacement)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        handler.active.load(Ordering::SeqCst),
+        0,
+        "successful repeated revoke must wait for all original handlers to drop"
+    );
+    peer.stop().await;
+    owner.stop().await;
 }
