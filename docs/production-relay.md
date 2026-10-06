@@ -420,7 +420,7 @@ curl https://relay.example.com/healthz
 ## What the gateway changes
 
 Behind nginx, the relay sees every connection coming from `127.0.0.1`. In
-0.1.0 that means:
+warren 0.1 that means:
 
 * **Per-address limits become one shared limit.** The 256-connections-per-
   address cap now covers all clients and nodes together. Each node holds one
