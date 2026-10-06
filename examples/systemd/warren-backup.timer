@@ -1,0 +1,15 @@
+# /etc/systemd/system/warren-backup.timer
+#
+# Daily at 06:15 UTC plus up to five minutes; a run missed while the server was off happens at
+# the next boot.
+[Unit]
+Description=Daily warren relay backup
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=warren-backup.service
+
+[Install]
+WantedBy=timers.target

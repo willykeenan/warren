@@ -6,6 +6,11 @@ and, if you use automatic certificates, TCP port 80. It holds no private keys
 of your machines and cannot read private links; it does see published (public)
 traffic, because it terminates TLS for it.
 
+For a complete production setup on a small Ubuntu server (a locked service
+user, nginx and certbot in front, daily backups copied off the server, a
+health check, and how to remove it all), see
+[production-relay.md](production-relay.md).
+
 ## Command line
 
 ```
@@ -218,9 +223,10 @@ only ever connect out to the relay.
 The state directory holds `relay.sqlite3` (enrolled nodes and their public
 keys, invite hashes, published names, custom domains) and certificates.
 Losing it means re-enrolling every machine. Back it up while the relay runs
-with `sqlite3 relay.sqlite3 ".backup /path/backup.sqlite3"`. The files contain
-no private keys of your machines; the TLS keys in it are private to the relay
-and are `0600`.
+with `sqlite3 relay.sqlite3 ".backup /path/backup.sqlite3"`, or daily with
+the script and timer in [production-relay.md](production-relay.md#8-backups).
+The files contain no private keys of your machines; the TLS keys in it are
+private to the relay and are `0600`.
 
 ## Limits enforced by the relay
 

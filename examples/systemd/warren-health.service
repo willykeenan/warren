@@ -1,0 +1,12 @@
+# ~/.config/systemd/user/warren-health.service  (started by warren-health.timer)
+#
+# Runs on a machine other than the relay, as an ordinary user. Copy
+# examples/scripts/warren-health.py to ~/.local/bin/ and adjust the names below.
+# Each run appends one JSON line to ~/.local/state/warren/health.jsonl; an unhealthy run
+# ends with status 1, so `systemctl --user status warren-health` shows it as failed.
+[Unit]
+Description=warren relay health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/warren-health.py --relay https://relay.example.com --publish-url https://relay.example.com/ --expect-ip 203.0.113.10 --out %h/.local/state/warren/health.jsonl
