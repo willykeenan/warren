@@ -46,16 +46,23 @@ a certificate from certbot; the hub runs on a Mac that publishes it through
 the relay. The whole setup, including backups, health checks and how to remove
 it, is in [docs/production-relay.md](docs/production-relay.md).
 
-Until then the hub was reached through a hosted tunnel. On the first
-evening the same page was loaded 25 times through each route, from the same
-client:
+Until then the hub was reached through a hosted tunnel, which stays up as
+the fallback. The product's web front end forwards every request to the hub
+over one of the two routes, so they can be compared like for like. In the 30
+minutes after the switch, four kinds of request (the sign-in page, a
+signed-in API call, the live activity feed and a 20 KB script) went through
+the front end 120 times each over warren and, at the same moments, over the
+hosted tunnel. Every request was a fresh connection from the same client, and
+every one succeeded:
 
-| route | p50 | p95 | max |
+| route | requests | p50 | p95 |
 |---|---:|---:|---:|
-| warren relay | 92 ms | 157 ms | 178 ms |
-| hosted tunnel | 119 ms | 201 ms | 431 ms |
+| warren relay | 480 | 148 ms | 311 ms |
+| hosted tunnel | 480 | 154 ms | 595 ms |
 
-That is one evening from one client, not a benchmark.
+The medians are about the same; at the 95th percentile warren took about half
+as long. That is one client over half an hour on a busy evening, not a
+benchmark.
 
 ## Quick start (about five minutes)
 
