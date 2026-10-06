@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 semantic versioning.
 
+## [Unreleased]
+
+Documentation only; the program is unchanged.
+
+### Added
+
+- `docs/production-relay.md`: running a relay in production on a small
+  Ubuntu server. It covers a locked, non-root service user; systemd units
+  that restart the relay; nginx in front with a certificate from certbot and
+  automatic renewal; daily state backups with an off-server copy and a
+  restore; a health check that appends one JSON line per run; and the exact
+  steps to stop and remove everything. It also lists what the gateway
+  changes: the relay sees every client as `127.0.0.1`, so per-address limits
+  are shared and `publish --allow` cannot tell clients apart.
+- `examples/`: the nginx sites, systemd units, certbot deploy hook, backup
+  script and health-check script that guide uses. The nginx gateway repeats
+  the WebSocket `Upgrade`/`Connection` headers in every location; without
+  them `/v1/node` answers 404 and nodes cannot enroll.
+- README: a *Field report* with latency measured in real use.
+
+### Changed
+
+- README *Status and limitations*: a relay has now run on Linux in
+  production; nodes have still run on macOS only.
+
 ## [0.1.0] - 2026-09-27
 
 First release. See *Status and limitations* in the README for what has and

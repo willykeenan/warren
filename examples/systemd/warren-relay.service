@@ -1,0 +1,39 @@
+# /etc/systemd/system/warren-relay.service
+#
+# The relay as the locked, non-login system user `warren`, listening only on loopback; nginx in
+# front takes the public ports (examples/nginx/). The certificate is the one certbot issues for
+# relay.example.com, copied to /var/lib/warren/certs/live by examples/scripts/warren-cert-renew.
+# Replace relay.example.com with your relay's name.
+[Unit]
+Description=warren relay
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=warren
+Group=warren
+Environment=WARREN_LOG=info
+ExecStart=/usr/local/bin/warren relay --domain relay.example.com --listen 127.0.0.1:8443 --state /var/lib/warren --cert /var/lib/warren/certs/live/fullchain.pem --key /var/lib/warren/certs/live/privkey.pem
+Restart=on-failure
+RestartSec=5
+# Room for the relay's 16384 connections (it raises its soft limit up to this).
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/warren
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Port 8443 needs no privileges, so the service keeps no capabilities at all.
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

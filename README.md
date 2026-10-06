@@ -38,6 +38,25 @@ also publish one local service on a public HTTPS name.
   Public traffic is, by necessity, TLS-terminated at the relay: the relay sees
   published traffic in plaintext. Private links never are.
 
+## Field report
+
+Since October 2026 warren has carried the traffic of a real product's web
+hub. The relay runs on a small Ubuntu server (1 GB of RAM) behind nginx, with
+a certificate from certbot; the hub runs on a Mac that publishes it through
+the relay. The whole setup, including backups, health checks and how to remove
+it, is in [docs/production-relay.md](docs/production-relay.md).
+
+Until then the hub was reached through a hosted tunnel. On the first
+evening the same page was loaded 25 times through each route, from the same
+client:
+
+| route | p50 | p95 | max |
+|---|---:|---:|---:|
+| warren relay | 92 ms | 157 ms | 178 ms |
+| hosted tunnel | 119 ms | 201 ms | 431 ms |
+
+That is one evening from one client, not a benchmark.
+
 ## Quick start (about five minutes)
 
 You need a small server with a public IP (the relay) and two machines. The
@@ -140,17 +159,20 @@ warren unpublish web
 
 warren is new. Read this before relying on it.
 
-* **Run on macOS only.** The relay, the node daemon and the login service
-  have been used on macOS. Linux is supported by the code (a systemd user
-  unit for nodes, the unit in [docs/relay.md](docs/relay.md) for the relay)
-  and the test suite passes on Linux too (CI runs it there), but warren has
-  not been run on real Linux machines yet; please report problems.
+* **Linux: the relay yes, nodes not yet.** A relay has run on an Ubuntu
+  server in production since October 2026 (see *Field report*). The node
+  daemon and the login service have been used on macOS only. Linux nodes are
+  supported by the code (a systemd user unit) and the test suite passes on
+  Linux too (CI runs it there), but no real Linux node has run yet; please
+  report problems.
 * **Automatic certificates have not been tested against a real CA.** The
   pieces around the ACME HTTP-01 exchange (challenge responder, renewal
   policy, storage) are unit-tested; the exchange with Let's Encrypt itself
   has not been run end to end. Start with `--acme-directory
   https://acme-staging-v02.api.letsencrypt.org/directory`, or bring your own
-  certificate with `--cert/--key`.
+  certificate with `--cert/--key`. The production setup in
+  [docs/production-relay.md](docs/production-relay.md) gets its certificate
+  from certbot instead.
 * **`warren install` / `uninstall`** are tested by writing the service file
   to a temporary directory and with a stand-in for the service manager; the
   real `launchctl` and `systemctl` calls are not run by the tests.
@@ -160,8 +182,8 @@ warren is new. Read this before relying on it.
   if it is down, nothing connects.
 * **TCP only**, and the relay's default listeners are IPv4 (see
   [docs/relay.md](docs/relay.md) for IPv6).
-* The performance figures below were measured on loopback, not over the
-  internet.
+* The figures under *Performance* were measured on loopback; *Field report*
+  has figures from real use over the internet.
 
 ## Commands
 
@@ -382,7 +404,8 @@ binaries are built there with `--remap-path-prefix`, so they carry no paths
 from the build machine; build any binary you publish the same way.
 
 Protocol details: [docs/protocol.md](docs/protocol.md). Relay operations:
-[docs/relay.md](docs/relay.md).
+[docs/relay.md](docs/relay.md). A relay in production, with nginx, certbot,
+backups and health checks: [docs/production-relay.md](docs/production-relay.md).
 
 All traffic goes through the relay; machines never connect to each other
 directly.

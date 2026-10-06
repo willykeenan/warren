@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+"""Consistent backup of a warren relay's state directory, safe while the relay runs.
+
+Install as /usr/local/sbin/warren-backup and run it from warren-backup.timer.
+It copies the state directory, takes relay.sqlite3 through SQLite's online
+backup API, checks the copy's integrity, and writes a private (0600)
+warren-YYYYMMDDTHHMMSSZ.tar.gz plus a latest.tar.gz symlink to it.
+
+Environment (all optional):
+  WARREN_STATE              state directory (default /var/lib/warren)
+  WARREN_BACKUP_DIR         where archives go (default /var/backups/warren)
+  WARREN_BACKUP_KEEP_DAYS   delete archives older than this many days (default 0: keep all)
+
+The archive holds the relay's TLS private key and every enrolled machine's
+public key and name: copy it off the server, and keep every copy private.
+"""
+
+import datetime
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import tarfile
+import tempfile
+import time
+
+os.umask(0o077)
+source = Path(os.environ.get("WARREN_STATE", "/var/lib/warren"))
+destination = Path(os.environ.get("WARREN_BACKUP_DIR", "/var/backups/warren"))
+keep_days = float(os.environ.get("WARREN_BACKUP_KEEP_DAYS", "0"))
+
+destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+with tempfile.TemporaryDirectory(prefix="snapshot-", dir=destination) as temporary:
+    snapshot = Path(temporary) / "warren"
+    shutil.copytree(source, snapshot, ignore=shutil.ignore_patterns("relay.sqlite3*", "*.sock"))
+    live = sqlite3.connect(f"file:{source / 'relay.sqlite3'}?mode=ro", uri=True)
+    copy = sqlite3.connect(snapshot / "relay.sqlite3")
+    try:
+        live.backup(copy)
+        result = copy.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            raise SystemExit(f"BACKUP_FAILED integrity_check={result}")
+    finally:
+        copy.close()
+        live.close()
+    archive = destination / f"warren-{stamp}.tar.gz"
+    pending = archive.with_suffix(".pending")
+    with tarfile.open(pending, "w:gz") as output:
+        output.add(snapshot, arcname="warren")
+    pending.chmod(0o600)
+    pending.replace(archive)
+    latest = destination / "latest.tar.gz"
+    replacement = destination / "latest.pending"
+    replacement.unlink(missing_ok=True)
+    replacement.symlink_to(archive.name)
+    replacement.replace(latest)
+
+removed = 0
+if keep_days > 0:
+    cutoff = time.time() - keep_days * 86400
+    for old in destination.glob("warren-*.tar.gz"):
+        if old != archive and old.stat().st_mtime < cutoff:
+            old.unlink()
+            removed += 1
+
+print(f"BACKUP_OK {archive.name} bytes={archive.stat().st_size} removed={removed}")

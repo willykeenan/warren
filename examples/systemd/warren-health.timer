@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/warren-health.timer
+#
+# Every five minutes. Enable with: systemctl --user enable --now warren-health.timer
+# (on a machine nobody stays logged in to, also run: loginctl enable-linger $USER)
+[Unit]
+Description=warren relay health check every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=warren-health.service
+
+[Install]
+WantedBy=timers.target

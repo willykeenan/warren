@@ -1,0 +1,20 @@
+#!/bin/bash
+# certbot deploy hook: install as /etc/letsencrypt/renewal-hooks/deploy/warren-cert-renew (mode 755).
+# certbot runs it after every successful issue or renewal. It copies the new certificate to where
+# the relay (user `warren`) can read it, restarts the relay so it serves the new certificate, and
+# reloads nginx. Nodes reconnect by themselves within seconds of the restart.
+#
+# `certbot renew --dry-run` does not run deploy hooks. To test this one once the relay runs:
+#   sudo RENEWED_LINEAGE=/etc/letsencrypt/live/relay.example.com /etc/letsencrypt/renewal-hooks/deploy/warren-cert-renew
+set -euo pipefail
+
+DOMAIN=relay.example.com          # the relay's --domain
+TARGET=/var/lib/warren/certs/live # matches --cert/--key in warren-relay.service
+
+test "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/$DOMAIN" || exit 0
+install -d -m 700 -o warren -g warren "$TARGET"
+install -m 600 -o warren -g warren "$RENEWED_LINEAGE/fullchain.pem" "$TARGET/fullchain.pem"
+install -m 600 -o warren -g warren "$RENEWED_LINEAGE/privkey.pem" "$TARGET/privkey.pem"
+systemctl restart warren-relay
+nginx -t
+systemctl reload nginx
