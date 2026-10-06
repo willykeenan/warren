@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 semantic versioning.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-06
 
-Documentation only; the program is unchanged.
+Documentation only; the program is unchanged apart from its version number.
 
 ### Added
 
@@ -89,4 +89,5 @@ has not been tested.
   prints the certificate pin of a self-signed relay; `warren ssh` checks its
   destination.
 
+[0.1.1]: https://github.com/willykeenan/warren/releases/tag/v0.1.1
 [0.1.0]: https://github.com/willykeenan/warren/releases/tag/v0.1.0
