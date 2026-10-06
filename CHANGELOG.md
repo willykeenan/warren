@@ -21,8 +21,11 @@ Documentation only; the program is unchanged apart from its version number.
 - `examples/`: the nginx sites, systemd units, certbot deploy hook, backup
   script and health-check script that guide uses. The nginx gateway repeats
   the WebSocket `Upgrade`/`Connection` headers in every location; without
-  them `/v1/node` answers 404 and nodes cannot enroll.
-- README: a *Field report* with latency measured in real use.
+  them `/v1/node` answers 404 and nodes cannot enroll. It also limits each
+  client by its own address (requests in progress, request rate, node
+  connection attempts), since the relay behind it sees only one address.
+- README: a *Field report* with latency measured in real use, the same
+  requests through warren and through a hosted tunnel at the same moments.
 
 ### Changed
 

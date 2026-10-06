@@ -184,7 +184,8 @@ systemctl show -p MainPID -p NRestarts warren-relay      # a new PID, NRestarts=
 [`examples/nginx/warren-https.conf`](../examples/nginx/warren-https.conf)
 sends `/v1/node` and `/healthz` to the relay and every other path to the
 published name `app`. The hop to the relay is TLS as well, checked against the
-same public certificate.
+same public certificate. It also limits each client by its own address; see
+*What the gateway changes* for why.
 
 ```sh
 sudo install -m 644 examples/nginx/warren-https.conf /etc/nginx/sites-available/warren-https
@@ -427,8 +428,14 @@ warren 0.1 that means:
   connection, and each open browser connection to the published app holds
   another. The limit of 5 failed enrollments per address per 10 minutes is
   shared too, so someone guessing codes can delay your next `warren join` by
-  up to ten minutes. nginx's `limit_conn` and `limit_req` per client address
-  can take over that job; they are not part of the tested example.
+  up to ten minutes. The example gateway therefore limits each client in
+  nginx (`limit_conn`/`limit_req` by client address): 64 requests in progress
+  per client, so no single client can take all 256 connections, and 6
+  connection attempts to `/v1/node` followed by one every 10 seconds, which
+  slows code guessing. nginx cannot tell a failed enrollment from a good one,
+  so one client can still cause the shared ten-minute wait. If a CDN or
+  another proxy sits in front of nginx, give nginx its addresses with
+  `set_real_ip_from`, or all of that proxy's clients share one limit.
 * **`warren publish --allow` cannot tell clients apart.** Every request comes
   from `127.0.0.1`, so an allowlist containing it admits everyone. Restrict
   access in nginx instead (`allow`/`deny` in `location /`).
